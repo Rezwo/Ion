@@ -54,7 +54,7 @@ export type IonPacket<T...> = {
 	}
 }
 
-export type TypeWriter<T = any> = (TargetBuffer : buffer, CurrentOffset : number, ValueToWrite : T, InstanceAccumulator : {Instance}?, InstanceLookup : {[Instance]: number}?) -> number
+export type TypeWriter<T = any> = (TargetBuffer : buffer, CurrentOffset : number, ValueToWrite : T, InstanceAccumulator : {Instance}?, InstanceLookup : {[Instance] : number}?) -> number
 export type TypeReader<T = any> = (SourceBuffer : buffer, CurrentOffset : number, InstanceSource : {Instance}?) -> (T, number)
 export type TypeSizer<T = any> = (ValueToCheck : T) -> number
 
@@ -80,7 +80,7 @@ local MainReliableRemote : RemoteEvent
 local MainUnreliableRemote : UnreliableRemoteEvent
 
 local SharedInstanceAccumulator : {Instance} = {}
-local SharedInstanceLookupTable : {[Instance]: number} = {}
+local SharedInstanceLookupTable : {[Instance] : number} = {}
 
 local function GetRemoteEvent(RemoteName : string, IsUnreliable : boolean) : RemoteEvent | UnreliableRemoteEvent
 	if IsServerEnvironment then
@@ -226,7 +226,7 @@ DataTypes.Boolean = {
 DataTypes.Instance = {
 	IsDynamic = false, ContainsInstances = true,
 	GetByteSize = function(_ : Instance) : number return 2 end,
-	Write = function(TargetBuffer, CurrentOffset, ValueToWrite: Instance, InstanceAccumulator: {Instance}?, InstanceLookup: {[Instance]: number}?)
+	Write = function(TargetBuffer, CurrentOffset, ValueToWrite: Instance, InstanceAccumulator: {Instance}?, InstanceLookup: {[Instance] : number}?)
 		if InstanceAccumulator and InstanceLookup then
 			local ExistingIndex = InstanceLookup[ValueToWrite]
 			if ExistingIndex then
@@ -562,13 +562,13 @@ end
 
 function DataTypes.Array<ValueType>(InnerType : TypeSerializer<ValueType>) : TypeSerializer<{ValueType}>
 	local InnerWrite, InnerRead, InnerSize = InnerType.Write, InnerType.Read, InnerType.GetByteSize
-	local IsInnerDynamic = InnerType.IsDynamic
+	local InnerIsDynamic = InnerType.IsDynamic
 
 	return {
 		IsDynamic = true, ContainsInstances = InnerType.ContainsInstances,
 		GetByteSize = function(ValuesToWrite)
 			local TotalSize = 2
-			if IsInnerDynamic then
+			if InnerIsDynamic then
 				for _, Item in ipairs(ValuesToWrite) do TotalSize += InnerSize(Item) end
 			else
 				TotalSize += (#ValuesToWrite * InnerSize(nil :: any))
@@ -1085,7 +1085,7 @@ end
 
 type RateLimitInfo = { LastCheck : number, Count : number }
 
-local RegistryWriters : { [number] : {(TargetBuffer : buffer, CurrentOffset : number, ValueToWrite : any, InstanceAccumulator : {Instance}?, InstanceLookup : {[Instance]: number}?) -> number} } = {}
+local RegistryWriters : { [number] : {(TargetBuffer : buffer, CurrentOffset : number, ValueToWrite : any, InstanceAccumulator : {Instance}?, InstanceLookup : {[Instance] : number}?) -> number} } = {}
 local RegistryReaders : { [number] : {(SourceBuffer : buffer, CurrentOffset : number, InstanceSource : {Instance}?) -> (any, number)} } = {}
 local RegistrySizers : { [number] : {(ValueToCheck : any) -> number} } = {}
 
@@ -1147,6 +1147,9 @@ function IonLibrary.Define(SchemaDefinitions : {TypeSerializer}, Options : Packe
 	local HeaderSize = if IsDedicated then 0 else 1
 	BasePacketSize += HeaderSize
 
+	-- Optimization 2: Pre-calculate static buffer size upvalue
+	local StaticBufferSize = if not IsSchemaDynamic then BasePacketSize else 0
+
 	local function SerializeArguments(ArgumentList : {any}) : (buffer, {Instance}?)
 		local InstanceAccumulator
 		local InstanceLookup
@@ -1158,8 +1161,9 @@ function IonLibrary.Define(SchemaDefinitions : {TypeSerializer}, Options : Packe
 			InstanceLookup = SharedInstanceLookupTable
 		end
 
-		local AllocationSize = BasePacketSize
+		local AllocationSize = StaticBufferSize
 		if IsSchemaDynamic then
+			AllocationSize = BasePacketSize
 			for Index = 1, #ArgumentList do
 				AllocationSize += PacketSizers[Index](ArgumentList[Index])
 			end
