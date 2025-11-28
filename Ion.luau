@@ -6,6 +6,41 @@ local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Players = game:GetService("Players")
 
+local BufferWriteU8 = buffer.writeu8
+local BufferWriteU16 = buffer.writeu16
+local BufferWriteU32 = buffer.writeu32
+local BufferWriteI8 = buffer.writei8
+local BufferWriteI16 = buffer.writei16
+local BufferWriteI32 = buffer.writei32
+local BufferWriteF32 = buffer.writef32
+local BufferWriteF64 = buffer.writef64
+local BufferWriteString = buffer.writestring
+local BufferWriteBits = buffer.writebits
+local BufferCopy = buffer.copy
+local BufferCreate = buffer.create
+local BufferLen = buffer.len
+
+local BufferReadU8 = buffer.readu8
+local BufferReadU16 = buffer.readu16
+local BufferReadU32 = buffer.readu32
+local BufferReadI8 = buffer.readi8
+local BufferReadI16 = buffer.readi16
+local BufferReadI32 = buffer.readi32
+local BufferReadF32 = buffer.readf32
+local BufferReadF64 = buffer.readf64
+local BufferReadString = buffer.readstring
+local BufferReadBits = buffer.readbits
+
+local Bit32LShift = bit32.lshift
+local Bit32RShift = bit32.rshift
+local Bit32Band = bit32.band
+local Bit32BTest = bit32.btest
+
+local MathRound = math.round
+local MathFrexp = math.frexp
+local MathLdexp = math.ldexp
+local MathFloor = math.floor
+
 export type IonPacket<T...> = {
 	Server : {
 		SendTo : (Recipient : Player, T...) -> (),
@@ -19,10 +54,14 @@ export type IonPacket<T...> = {
 	}
 }
 
+export type TypeWriter<T = any> = (TargetBuffer : buffer, CurrentOffset : number, ValueToWrite : T, InstanceAccumulator : {Instance}?, InstanceLookup : {[Instance]: number}?) -> number
+export type TypeReader<T = any> = (SourceBuffer : buffer, CurrentOffset : number, InstanceSource : {Instance}?) -> (T, number)
+export type TypeSizer<T = any> = (ValueToCheck : T) -> number
+
 export type TypeSerializer<ValueType = any> = {
-	Write : (TargetBuffer : buffer, CurrentOffset : number, ValueToWrite : ValueType, InstanceAccumulator : {Instance}?, InstanceLookup : {[Instance]: number}?) -> number,
-	Read : (SourceBuffer : buffer, CurrentOffset : number, InstanceSource : {Instance}?) -> (ValueType, number),
-	GetByteSize : (ValueToCheck : ValueType) -> number,
+	Write : TypeWriter<ValueType>,
+	Read : TypeReader<ValueType>,
+	GetByteSize : TypeSizer<ValueType>,
 	IsDynamic : boolean,
 	ContainsInstances : boolean
 }
@@ -40,7 +79,8 @@ local IsServerEnvironment = RunService:IsServer()
 local MainReliableRemote : RemoteEvent
 local MainUnreliableRemote : UnreliableRemoteEvent
 
-local SharedInstanceLookupTable = {}
+local SharedInstanceAccumulator : {Instance} = {}
+local SharedInstanceLookupTable : {[Instance]: number} = {}
 
 local function GetRemoteEvent(RemoteName : string, IsUnreliable : boolean) : RemoteEvent | UnreliableRemoteEvent
 	if IsServerEnvironment then
@@ -65,35 +105,35 @@ local function WriteFloat16(TargetBuffer : buffer, ByteOffset : number, ValueToW
 
 	local EncodedValue = 0
 	if ValueToWrite ~= 0 then
-		local Mantissa, Exponent = math.frexp(ValueToWrite)
+		local Mantissa, Exponent = MathFrexp(ValueToWrite)
 		Exponent += 14
 		if Exponent <= 0 then
-			Mantissa = math.ldexp(Mantissa, Exponent + 10)
-			EncodedValue = SignBit + math.floor(Mantissa + 0.5)
+			Mantissa = MathLdexp(Mantissa, Exponent + 10)
+			EncodedValue = SignBit + MathFloor(Mantissa + 0.5)
 		elseif Exponent >= 32 then
 			EncodedValue = SignBit + 0x7C00
 		else
-			EncodedValue = SignBit + bit32.lshift(Exponent, 10) + math.floor(Mantissa * 1024 + 0.5) % 1024
+			EncodedValue = SignBit + Bit32LShift(Exponent, 10) + MathFloor(Mantissa * 1024 + 0.5) % 1024
 		end
 	end
-	buffer.writeu16(TargetBuffer, ByteOffset, EncodedValue)
+	BufferWriteU16(TargetBuffer, ByteOffset, EncodedValue)
 end
 
 local function ReadFloat16(SourceBuffer : buffer, ByteOffset : number) : number
-	local EncodedValue = buffer.readu16(SourceBuffer, ByteOffset)
-	local SignBit = bit32.btest(EncodedValue, 0x8000)
-	local Exponent = bit32.rshift(bit32.band(EncodedValue, 0x7C00), 10)
-	local Mantissa = bit32.band(EncodedValue, 0x03FF)
+	local EncodedValue = BufferReadU16(SourceBuffer, ByteOffset)
+	local SignBit = Bit32BTest(EncodedValue, 0x8000)
+	local Exponent = Bit32RShift(Bit32Band(EncodedValue, 0x7C00), 10)
+	local Mantissa = Bit32Band(EncodedValue, 0x03FF)
 
 	if Exponent == 0 then
 		if Mantissa == 0 then return 0 end
-		local ResultValue = math.ldexp(Mantissa, -24)
+		local ResultValue = MathLdexp(Mantissa, -24)
 		return if SignBit then -ResultValue else ResultValue
 	elseif Exponent == 31 then
 		return if Mantissa == 0 then (if SignBit then -math.huge else math.huge) else 0/0
 	end
 
-	local ResultValue = math.ldexp(Mantissa + 1024, Exponent - 25)
+	local ResultValue = MathLdexp(Mantissa + 1024, Exponent - 25)
 	return if SignBit then -ResultValue else ResultValue
 end
 
@@ -102,25 +142,15 @@ local DataTypes = {}
 DataTypes.Byte = {
 	IsDynamic = false, ContainsInstances = false,
 	GetByteSize = function(_ : number) : number return 1 end,
-	Write = function(TargetBuffer : buffer, CurrentOffset : number, ValueToWrite : number) : number 
-		buffer.writeu8(TargetBuffer, CurrentOffset, ValueToWrite or 0) 
-		return CurrentOffset + 1 
-	end,
-	Read = function(SourceBuffer : buffer, CurrentOffset : number) : (number, number) 
-		return buffer.readu8(SourceBuffer, CurrentOffset), CurrentOffset + 1 
-	end
+	Write = function(TargetBuffer, CurrentOffset, ValueToWrite) BufferWriteU8(TargetBuffer, CurrentOffset, ValueToWrite or 0); return CurrentOffset + 1 end,
+	Read = function(SourceBuffer, CurrentOffset) return BufferReadU8(SourceBuffer, CurrentOffset), CurrentOffset + 1 end
 } :: TypeSerializer<number>
 
 DataTypes.Int8 = {
 	IsDynamic = false, ContainsInstances = false,
 	GetByteSize = function(_ : number) : number return 1 end,
-	Write = function(TargetBuffer : buffer, CurrentOffset : number, ValueToWrite : number) : number 
-		buffer.writei8(TargetBuffer, CurrentOffset, ValueToWrite or 0) 
-		return CurrentOffset + 1 
-	end,
-	Read = function(SourceBuffer : buffer, CurrentOffset : number) : (number, number) 
-		return buffer.readi8(SourceBuffer, CurrentOffset), CurrentOffset + 1 
-	end
+	Write = function(TargetBuffer, CurrentOffset, ValueToWrite) BufferWriteI8(TargetBuffer, CurrentOffset, ValueToWrite or 0); return CurrentOffset + 1 end,
+	Read = function(SourceBuffer, CurrentOffset) return BufferReadI8(SourceBuffer, CurrentOffset), CurrentOffset + 1 end
 } :: TypeSerializer<number>
 
 DataTypes.UInt8 = DataTypes.Byte
@@ -128,132 +158,92 @@ DataTypes.UInt8 = DataTypes.Byte
 DataTypes.Int16 = {
 	IsDynamic = false, ContainsInstances = false,
 	GetByteSize = function(_ : number) : number return 2 end,
-	Write = function(TargetBuffer : buffer, CurrentOffset : number, ValueToWrite : number) : number 
-		buffer.writei16(TargetBuffer, CurrentOffset, ValueToWrite or 0) 
-		return CurrentOffset + 2 
-	end,
-	Read = function(SourceBuffer : buffer, CurrentOffset : number) : (number, number) 
-		return buffer.readi16(SourceBuffer, CurrentOffset), CurrentOffset + 2 
-	end
+	Write = function(TargetBuffer, CurrentOffset, ValueToWrite) BufferWriteI16(TargetBuffer, CurrentOffset, ValueToWrite or 0); return CurrentOffset + 2 end,
+	Read = function(SourceBuffer, CurrentOffset) return BufferReadI16(SourceBuffer, CurrentOffset), CurrentOffset + 2 end
 } :: TypeSerializer<number>
 
 DataTypes.UInt16 = {
 	IsDynamic = false, ContainsInstances = false,
 	GetByteSize = function(_ : number) : number return 2 end,
-	Write = function(TargetBuffer : buffer, CurrentOffset : number, ValueToWrite : number) : number 
-		buffer.writeu16(TargetBuffer, CurrentOffset, ValueToWrite or 0) 
-		return CurrentOffset + 2 
-	end,
-	Read = function(SourceBuffer : buffer, CurrentOffset : number) : (number, number) 
-		return buffer.readu16(SourceBuffer, CurrentOffset), CurrentOffset + 2 
-	end
+	Write = function(TargetBuffer, CurrentOffset, ValueToWrite) BufferWriteU16(TargetBuffer, CurrentOffset, ValueToWrite or 0); return CurrentOffset + 2 end,
+	Read = function(SourceBuffer, CurrentOffset) return BufferReadU16(SourceBuffer, CurrentOffset), CurrentOffset + 2 end
 } :: TypeSerializer<number>
 
 DataTypes.UInt24 = {
 	IsDynamic = false, ContainsInstances = false,
 	GetByteSize = function(_ : number) : number return 3 end,
-	Write = function(TargetBuffer : buffer, CurrentOffset : number, ValueToWrite : number) : number 
-		buffer.writebits(TargetBuffer, CurrentOffset * 8, 24, ValueToWrite or 0) 
+	Write = function(TargetBuffer: buffer, CurrentOffset: number, ValueToWrite: number) 
+		BufferWriteBits(TargetBuffer, CurrentOffset * 8, 24, ValueToWrite or 0)
 		return CurrentOffset + 3 
 	end,
-	Read = function(SourceBuffer : buffer, CurrentOffset : number) : (number, number) 
-		return buffer.readbits(SourceBuffer, CurrentOffset * 8, 24), CurrentOffset + 3 
+	Read = function(SourceBuffer: buffer, CurrentOffset: number) 
+		return BufferReadBits(SourceBuffer, CurrentOffset * 8, 24), CurrentOffset + 3 
 	end
 } :: TypeSerializer<number>
 
 DataTypes.Int32 = {
 	IsDynamic = false, ContainsInstances = false,
 	GetByteSize = function(_ : number) : number return 4 end,
-	Write = function(TargetBuffer : buffer, CurrentOffset : number, ValueToWrite : number) : number 
-		buffer.writei32(TargetBuffer, CurrentOffset, ValueToWrite or 0) 
-		return CurrentOffset + 4 
-	end,
-	Read = function(SourceBuffer : buffer, CurrentOffset : number) : (number, number) 
-		return buffer.readi32(SourceBuffer, CurrentOffset), CurrentOffset + 4 
-	end
+	Write = function(TargetBuffer, CurrentOffset, ValueToWrite) BufferWriteI32(TargetBuffer, CurrentOffset, ValueToWrite or 0); return CurrentOffset + 4 end,
+	Read = function(SourceBuffer, CurrentOffset) return BufferReadI32(SourceBuffer, CurrentOffset), CurrentOffset + 4 end
 } :: TypeSerializer<number>
 
 DataTypes.UInt32 = {
 	IsDynamic = false, ContainsInstances = false,
 	GetByteSize = function(_ : number) : number return 4 end,
-	Write = function(TargetBuffer : buffer, CurrentOffset : number, ValueToWrite : number) : number 
-		buffer.writeu32(TargetBuffer, CurrentOffset, ValueToWrite or 0) 
-		return CurrentOffset + 4 
-	end,
-	Read = function(SourceBuffer : buffer, CurrentOffset : number) : (number, number) 
-		return buffer.readu32(SourceBuffer, CurrentOffset), CurrentOffset + 4 
-	end
+	Write = function(TargetBuffer, CurrentOffset, ValueToWrite) BufferWriteU32(TargetBuffer, CurrentOffset, ValueToWrite or 0); return CurrentOffset + 4 end,
+	Read = function(SourceBuffer, CurrentOffset) return BufferReadU32(SourceBuffer, CurrentOffset), CurrentOffset + 4 end
 } :: TypeSerializer<number>
 
 DataTypes.Float16 = {
 	IsDynamic = false, ContainsInstances = false,
 	GetByteSize = function(_ : number) : number return 2 end,
-	Write = function(TargetBuffer : buffer, CurrentOffset : number, ValueToWrite : number) : number 
-		WriteFloat16(TargetBuffer, CurrentOffset, ValueToWrite or 0) 
-		return CurrentOffset + 2 
-	end,
-	Read = function(SourceBuffer : buffer, CurrentOffset : number) : (number, number) 
-		return ReadFloat16(SourceBuffer, CurrentOffset), CurrentOffset + 2 
-	end
+	Write = function(TargetBuffer, CurrentOffset, ValueToWrite) WriteFloat16(TargetBuffer, CurrentOffset, ValueToWrite or 0); return CurrentOffset + 2 end,
+	Read = function(SourceBuffer, CurrentOffset) return ReadFloat16(SourceBuffer, CurrentOffset), CurrentOffset + 2 end
 } :: TypeSerializer<number>
 
 DataTypes.Float32 = {
 	IsDynamic = false, ContainsInstances = false,
 	GetByteSize = function(_ : number) : number return 4 end,
-	Write = function(TargetBuffer : buffer, CurrentOffset : number, ValueToWrite : number) : number 
-		buffer.writef32(TargetBuffer, CurrentOffset, ValueToWrite or 0) 
-		return CurrentOffset + 4 
-	end,
-	Read = function(SourceBuffer : buffer, CurrentOffset : number) : (number, number) 
-		return buffer.readf32(SourceBuffer, CurrentOffset), CurrentOffset + 4 
-	end
+	Write = function(TargetBuffer, CurrentOffset, ValueToWrite) BufferWriteF32(TargetBuffer, CurrentOffset, ValueToWrite or 0); return CurrentOffset + 4 end,
+	Read = function(SourceBuffer, CurrentOffset) return BufferReadF32(SourceBuffer, CurrentOffset), CurrentOffset + 4 end
 } :: TypeSerializer<number>
 
 DataTypes.Float64 = {
 	IsDynamic = false, ContainsInstances = false,
 	GetByteSize = function(_ : number) : number return 8 end,
-	Write = function(TargetBuffer : buffer, CurrentOffset : number, ValueToWrite : number) : number 
-		buffer.writef64(TargetBuffer, CurrentOffset, ValueToWrite or 0) 
-		return CurrentOffset + 8 
-	end,
-	Read = function(SourceBuffer : buffer, CurrentOffset : number) : (number, number) 
-		return buffer.readf64(SourceBuffer, CurrentOffset), CurrentOffset + 8 
-	end
+	Write = function(TargetBuffer, CurrentOffset, ValueToWrite) BufferWriteF64(TargetBuffer, CurrentOffset, ValueToWrite or 0); return CurrentOffset + 8 end,
+	Read = function(SourceBuffer, CurrentOffset) return BufferReadF64(SourceBuffer, CurrentOffset), CurrentOffset + 8 end
 } :: TypeSerializer<number>
 
 DataTypes.Boolean = {
 	IsDynamic = false, ContainsInstances = false,
 	GetByteSize = function(_ : boolean) : number return 1 end,
-	Write = function(TargetBuffer : buffer, CurrentOffset : number, ValueToWrite : boolean) : number 
-		buffer.writeu8(TargetBuffer, CurrentOffset, if ValueToWrite then 1 else 0) 
-		return CurrentOffset + 1 
-	end,
-	Read = function(SourceBuffer : buffer, CurrentOffset : number) : (boolean, number) 
-		return buffer.readu8(SourceBuffer, CurrentOffset) == 1, CurrentOffset + 1 
-	end
+	Write = function(TargetBuffer, CurrentOffset, ValueToWrite) BufferWriteU8(TargetBuffer, CurrentOffset, if ValueToWrite then 1 else 0); return CurrentOffset + 1 end,
+	Read = function(SourceBuffer, CurrentOffset) return BufferReadU8(SourceBuffer, CurrentOffset) == 1, CurrentOffset + 1 end
 } :: TypeSerializer<boolean>
 
 DataTypes.Instance = {
 	IsDynamic = false, ContainsInstances = true,
 	GetByteSize = function(_ : Instance) : number return 2 end,
-	Write = function(TargetBuffer : buffer, CurrentOffset : number, ValueToWrite : Instance, InstanceAccumulator : {Instance}?, InstanceLookup : {[Instance]: number}?) : number
+	Write = function(TargetBuffer, CurrentOffset, ValueToWrite: Instance, InstanceAccumulator: {Instance}?, InstanceLookup: {[Instance]: number}?)
 		if InstanceAccumulator and InstanceLookup then
 			local ExistingIndex = InstanceLookup[ValueToWrite]
 			if ExistingIndex then
-				buffer.writeu16(TargetBuffer, CurrentOffset, ExistingIndex)
+				BufferWriteU16(TargetBuffer, CurrentOffset, ExistingIndex)
 			else
 				local NewIndex = #InstanceAccumulator + 1
 				InstanceAccumulator[NewIndex] = ValueToWrite
 				InstanceLookup[ValueToWrite] = NewIndex
-				buffer.writeu16(TargetBuffer, CurrentOffset, NewIndex)
+				BufferWriteU16(TargetBuffer, CurrentOffset, NewIndex)
 			end
 		else
-			buffer.writeu16(TargetBuffer, CurrentOffset, 0) 
+			BufferWriteU16(TargetBuffer, CurrentOffset, 0) 
 		end
 		return CurrentOffset + 2
 	end,
-	Read = function(SourceBuffer : buffer, CurrentOffset : number, InstanceSource : {Instance}?) : (Instance?, number)
-		local InstanceIndex = buffer.readu16(SourceBuffer, CurrentOffset)
+	Read = function(SourceBuffer, CurrentOffset, InstanceSource)
+		local InstanceIndex = BufferReadU16(SourceBuffer, CurrentOffset)
 		return if InstanceSource and InstanceSource[InstanceIndex] then InstanceSource[InstanceIndex] else nil, CurrentOffset + 2
 	end
 } :: TypeSerializer<Instance>
@@ -261,48 +251,35 @@ DataTypes.Instance = {
 DataTypes.Enum = {
 	IsDynamic = false, ContainsInstances = false,
 	GetByteSize = function(_ : EnumItem) : number return 2 end,
-	Write = function(TargetBuffer : buffer, CurrentOffset : number, ValueToWrite : EnumItem) : number 
-		buffer.writeu16(TargetBuffer, CurrentOffset, ValueToWrite.Value) 
-		return CurrentOffset + 2 
-	end,
-	Read = function(SourceBuffer : buffer, CurrentOffset : number) : (number, number) 
-		return buffer.readu16(SourceBuffer, CurrentOffset), CurrentOffset + 2 
-	end
+	Write = function(TargetBuffer, CurrentOffset, ValueToWrite: EnumItem) BufferWriteU16(TargetBuffer, CurrentOffset, ValueToWrite.Value); return CurrentOffset + 2 end,
+	Read = function(SourceBuffer, CurrentOffset) return BufferReadU16(SourceBuffer, CurrentOffset), CurrentOffset + 2 end
 } :: TypeSerializer<EnumItem>
 
 DataTypes.NativeVector = {
 	IsDynamic = false, ContainsInstances = false,
 	GetByteSize = function(_ : vector) : number return 12 end,
-	Write = function(TargetBuffer : buffer, CurrentOffset : number, ValueToWrite : vector) : number
-		buffer.writef32(TargetBuffer, CurrentOffset, ValueToWrite.x)
-		buffer.writef32(TargetBuffer, CurrentOffset + 4, ValueToWrite.y)
-		buffer.writef32(TargetBuffer, CurrentOffset + 8, ValueToWrite.z)
+	Write = function(TargetBuffer, CurrentOffset, ValueToWrite: vector)
+		BufferWriteF32(TargetBuffer, CurrentOffset, ValueToWrite.x)
+		BufferWriteF32(TargetBuffer, CurrentOffset + 4, ValueToWrite.y)
+		BufferWriteF32(TargetBuffer, CurrentOffset + 8, ValueToWrite.z)
 		return CurrentOffset + 12
 	end,
-	Read = function(SourceBuffer : buffer, CurrentOffset : number) : (vector, number)
-		return vector.create(
-			buffer.readf32(SourceBuffer, CurrentOffset), 
-			buffer.readf32(SourceBuffer, CurrentOffset + 4), 
-			buffer.readf32(SourceBuffer, CurrentOffset + 8)
-		), CurrentOffset + 12
+	Read = function(SourceBuffer, CurrentOffset)
+		return vector.create(BufferReadF32(SourceBuffer, CurrentOffset), BufferReadF32(SourceBuffer, CurrentOffset + 4), BufferReadF32(SourceBuffer, CurrentOffset + 8)), CurrentOffset + 12
 	end
 } :: TypeSerializer<vector>
 
 DataTypes.Vector3Float32 = {
 	IsDynamic = false, ContainsInstances = false,
 	GetByteSize = function(_ : Vector3) : number return 12 end,
-	Write = function(TargetBuffer : buffer, CurrentOffset : number, ValueToWrite : Vector3) : number
-		buffer.writef32(TargetBuffer, CurrentOffset, ValueToWrite.X)
-		buffer.writef32(TargetBuffer, CurrentOffset + 4, ValueToWrite.Y)
-		buffer.writef32(TargetBuffer, CurrentOffset + 8, ValueToWrite.Z)
+	Write = function(TargetBuffer, CurrentOffset, ValueToWrite: Vector3)
+		BufferWriteF32(TargetBuffer, CurrentOffset, ValueToWrite.X)
+		BufferWriteF32(TargetBuffer, CurrentOffset + 4, ValueToWrite.Y)
+		BufferWriteF32(TargetBuffer, CurrentOffset + 8, ValueToWrite.Z)
 		return CurrentOffset + 12
 	end,
-	Read = function(SourceBuffer : buffer, CurrentOffset : number) : (Vector3, number)
-		return Vector3.new(
-			buffer.readf32(SourceBuffer, CurrentOffset), 
-			buffer.readf32(SourceBuffer, CurrentOffset + 4), 
-			buffer.readf32(SourceBuffer, CurrentOffset + 8)
-		), CurrentOffset + 12
+	Read = function(SourceBuffer, CurrentOffset)
+		return Vector3.new(BufferReadF32(SourceBuffer, CurrentOffset), BufferReadF32(SourceBuffer, CurrentOffset + 4), BufferReadF32(SourceBuffer, CurrentOffset + 8)), CurrentOffset + 12
 	end
 } :: TypeSerializer<Vector3>
 
@@ -311,108 +288,89 @@ DataTypes.Vector3 = DataTypes.Vector3Float32
 DataTypes.Vector3Float16 = {
 	IsDynamic = false, ContainsInstances = false,
 	GetByteSize = function(_ : Vector3) : number return 6 end,
-	Write = function(TargetBuffer : buffer, CurrentOffset : number, ValueToWrite : Vector3) : number
+	Write = function(TargetBuffer, CurrentOffset, ValueToWrite: Vector3)
 		WriteFloat16(TargetBuffer, CurrentOffset, ValueToWrite.X)
 		WriteFloat16(TargetBuffer, CurrentOffset + 2, ValueToWrite.Y)
 		WriteFloat16(TargetBuffer, CurrentOffset + 4, ValueToWrite.Z)
 		return CurrentOffset + 6
 	end,
-	Read = function(SourceBuffer : buffer, CurrentOffset : number) : (Vector3, number)
-		local VectorX = ReadFloat16(SourceBuffer, CurrentOffset)
-		local VectorY = ReadFloat16(SourceBuffer, CurrentOffset + 2)
-		local VectorZ = ReadFloat16(SourceBuffer, CurrentOffset + 4)
-		return Vector3.new(VectorX, VectorY, VectorZ), CurrentOffset + 6
+	Read = function(SourceBuffer, CurrentOffset)
+		return Vector3.new(ReadFloat16(SourceBuffer, CurrentOffset), ReadFloat16(SourceBuffer, CurrentOffset + 2), ReadFloat16(SourceBuffer, CurrentOffset + 4)), CurrentOffset + 6
 	end
 } :: TypeSerializer<Vector3>
 
 DataTypes.Vector3Float64 = {
 	IsDynamic = false, ContainsInstances = false,
 	GetByteSize = function(_ : Vector3) : number return 24 end,
-	Write = function(TargetBuffer : buffer, CurrentOffset : number, ValueToWrite : Vector3) : number
-		buffer.writef64(TargetBuffer, CurrentOffset, ValueToWrite.X)
-		buffer.writef64(TargetBuffer, CurrentOffset + 8, ValueToWrite.Y)
-		buffer.writef64(TargetBuffer, CurrentOffset + 16, ValueToWrite.Z)
+	Write = function(TargetBuffer, CurrentOffset, ValueToWrite: Vector3)
+		BufferWriteF64(TargetBuffer, CurrentOffset, ValueToWrite.X)
+		BufferWriteF64(TargetBuffer, CurrentOffset + 8, ValueToWrite.Y)
+		BufferWriteF64(TargetBuffer, CurrentOffset + 16, ValueToWrite.Z)
 		return CurrentOffset + 24
 	end,
-	Read = function(SourceBuffer : buffer, CurrentOffset : number) : (Vector3, number)
-		return Vector3.new(
-			buffer.readf64(SourceBuffer, CurrentOffset), 
-			buffer.readf64(SourceBuffer, CurrentOffset + 8), 
-			buffer.readf64(SourceBuffer, CurrentOffset + 16)
-		), CurrentOffset + 24
+	Read = function(SourceBuffer, CurrentOffset)
+		return Vector3.new(BufferReadF64(SourceBuffer, CurrentOffset), BufferReadF64(SourceBuffer, CurrentOffset + 8), BufferReadF64(SourceBuffer, CurrentOffset + 16)), CurrentOffset + 24
 	end
 } :: TypeSerializer<Vector3>
 
 DataTypes.Vector3Int8 = {
 	IsDynamic = false, ContainsInstances = false,
 	GetByteSize = function(_ : Vector3) : number return 3 end,
-	Write = function(TargetBuffer : buffer, CurrentOffset : number, ValueToWrite : Vector3) : number
-		buffer.writei8(TargetBuffer, CurrentOffset, math.round(ValueToWrite.X))
-		buffer.writei8(TargetBuffer, CurrentOffset + 1, math.round(ValueToWrite.Y))
-		buffer.writei8(TargetBuffer, CurrentOffset + 2, math.round(ValueToWrite.Z))
+	Write = function(TargetBuffer, CurrentOffset, ValueToWrite: Vector3)
+		BufferWriteI8(TargetBuffer, CurrentOffset, MathRound(ValueToWrite.X))
+		BufferWriteI8(TargetBuffer, CurrentOffset + 1, MathRound(ValueToWrite.Y))
+		BufferWriteI8(TargetBuffer, CurrentOffset + 2, MathRound(ValueToWrite.Z))
 		return CurrentOffset + 3
 	end,
-	Read = function(SourceBuffer : buffer, CurrentOffset : number) : (Vector3, number)
-		return Vector3.new(
-			buffer.readi8(SourceBuffer, CurrentOffset), 
-			buffer.readi8(SourceBuffer, CurrentOffset + 1), 
-			buffer.readi8(SourceBuffer, CurrentOffset + 2)
-		), CurrentOffset + 3
+	Read = function(SourceBuffer, CurrentOffset)
+		return Vector3.new(BufferReadI8(SourceBuffer, CurrentOffset), BufferReadI8(SourceBuffer, CurrentOffset + 1), BufferReadI8(SourceBuffer, CurrentOffset + 2)), CurrentOffset + 3
 	end
 } :: TypeSerializer<Vector3>
 
 DataTypes.Vector3Int16 = {
 	IsDynamic = false, ContainsInstances = false,
 	GetByteSize = function(_ : Vector3) : number return 6 end,
-	Write = function(TargetBuffer : buffer, CurrentOffset : number, ValueToWrite : Vector3) : number
-		buffer.writei16(TargetBuffer, CurrentOffset, math.round(ValueToWrite.X))
-		buffer.writei16(TargetBuffer, CurrentOffset + 2, math.round(ValueToWrite.Y))
-		buffer.writei16(TargetBuffer, CurrentOffset + 4, math.round(ValueToWrite.Z))
+	Write = function(TargetBuffer, CurrentOffset, ValueToWrite: Vector3)
+		BufferWriteI16(TargetBuffer, CurrentOffset, MathRound(ValueToWrite.X))
+		BufferWriteI16(TargetBuffer, CurrentOffset + 2, MathRound(ValueToWrite.Y))
+		BufferWriteI16(TargetBuffer, CurrentOffset + 4, MathRound(ValueToWrite.Z))
 		return CurrentOffset + 6
 	end,
-	Read = function(SourceBuffer : buffer, CurrentOffset : number) : (Vector3, number)
-		return Vector3.new(
-			buffer.readi16(SourceBuffer, CurrentOffset), 
-			buffer.readi16(SourceBuffer, CurrentOffset + 2), 
-			buffer.readi16(SourceBuffer, CurrentOffset + 4)
-		), CurrentOffset + 6
+	Read = function(SourceBuffer, CurrentOffset)
+		return Vector3.new(BufferReadI16(SourceBuffer, CurrentOffset), BufferReadI16(SourceBuffer, CurrentOffset + 2), BufferReadI16(SourceBuffer, CurrentOffset + 4)), CurrentOffset + 6
 	end
 } :: TypeSerializer<Vector3>
 
 DataTypes.Vector3Int32 = {
 	IsDynamic = false, ContainsInstances = false,
 	GetByteSize = function(_ : Vector3) : number return 12 end,
-	Write = function(TargetBuffer : buffer, CurrentOffset : number, ValueToWrite : Vector3) : number
-		buffer.writei32(TargetBuffer, CurrentOffset, math.round(ValueToWrite.X))
-		buffer.writei32(TargetBuffer, CurrentOffset + 4, math.round(ValueToWrite.Y))
-		buffer.writei32(TargetBuffer, CurrentOffset + 8, math.round(ValueToWrite.Z))
+	Write = function(TargetBuffer, CurrentOffset, ValueToWrite: Vector3)
+		BufferWriteI32(TargetBuffer, CurrentOffset, MathRound(ValueToWrite.X))
+		BufferWriteI32(TargetBuffer, CurrentOffset + 4, MathRound(ValueToWrite.Y))
+		BufferWriteI32(TargetBuffer, CurrentOffset + 8, MathRound(ValueToWrite.Z))
 		return CurrentOffset + 12
 	end,
-	Read = function(SourceBuffer : buffer, CurrentOffset : number) : (Vector3, number)
-		return Vector3.new(
-			buffer.readi32(SourceBuffer, CurrentOffset), 
-			buffer.readi32(SourceBuffer, CurrentOffset + 4), 
-			buffer.readi32(SourceBuffer, CurrentOffset + 8)
-		), CurrentOffset + 12
+	Read = function(SourceBuffer, CurrentOffset)
+		return Vector3.new(BufferReadI32(SourceBuffer, CurrentOffset), BufferReadI32(SourceBuffer, CurrentOffset + 4), BufferReadI32(SourceBuffer, CurrentOffset + 8)), CurrentOffset + 12
 	end
 } :: TypeSerializer<Vector3>
 
 DataTypes.CFrame = {
 	IsDynamic = false, ContainsInstances = false,
 	GetByteSize = function(_ : CFrame) : number return 18 end,
-	Write = function(TargetBuffer : buffer, CurrentOffset : number, ValueToWrite : CFrame) : number
-		buffer.writef32(TargetBuffer, CurrentOffset, ValueToWrite.X)
-		buffer.writef32(TargetBuffer, CurrentOffset + 4, ValueToWrite.Y)
-		buffer.writef32(TargetBuffer, CurrentOffset + 8, ValueToWrite.Z)
+	Write = function(TargetBuffer: buffer, CurrentOffset: number, ValueToWrite: CFrame)
+		BufferWriteF32(TargetBuffer, CurrentOffset, ValueToWrite.X)
+		BufferWriteF32(TargetBuffer, CurrentOffset + 4, ValueToWrite.Y)
+		BufferWriteF32(TargetBuffer, CurrentOffset + 8, ValueToWrite.Z)
 		local EulerAngleX, EulerAngleY, EulerAngleZ = ValueToWrite:ToEulerAnglesXYZ()
-		buffer.writeu16(TargetBuffer, CurrentOffset + 12, EulerAngleX * 10430.2191955 + 0.5)
-		buffer.writeu16(TargetBuffer, CurrentOffset + 14, EulerAngleY * 10430.2191955 + 0.5)
-		buffer.writeu16(TargetBuffer, CurrentOffset + 16, EulerAngleZ * 10430.2191955 + 0.5)
+		BufferWriteU16(TargetBuffer, CurrentOffset + 12, EulerAngleX * 10430.2191955 + 0.5)
+		BufferWriteU16(TargetBuffer, CurrentOffset + 14, EulerAngleY * 10430.2191955 + 0.5)
+		BufferWriteU16(TargetBuffer, CurrentOffset + 16, EulerAngleZ * 10430.2191955 + 0.5)
 		return CurrentOffset + 18
 	end,
-	Read = function(SourceBuffer : buffer, CurrentOffset : number) : (CFrame, number)
-		local PositionX, PositionY, PositionZ = buffer.readf32(SourceBuffer, CurrentOffset), buffer.readf32(SourceBuffer, CurrentOffset + 4), buffer.readf32(SourceBuffer, CurrentOffset + 8)
-		local EulerAngleX, EulerAngleY, EulerAngleZ = buffer.readu16(SourceBuffer, CurrentOffset + 12) / 10430.2191955, buffer.readu16(SourceBuffer, CurrentOffset + 14) / 10430.2191955, buffer.readu16(SourceBuffer, CurrentOffset + 16) / 10430.2191955
+	Read = function(SourceBuffer, CurrentOffset)
+		local PositionX, PositionY, PositionZ = BufferReadF32(SourceBuffer, CurrentOffset), BufferReadF32(SourceBuffer, CurrentOffset + 4), BufferReadF32(SourceBuffer, CurrentOffset + 8)
+		local EulerAngleX, EulerAngleY, EulerAngleZ = BufferReadU16(SourceBuffer, CurrentOffset + 12) / 10430.2191955, BufferReadU16(SourceBuffer, CurrentOffset + 14) / 10430.2191955, BufferReadU16(SourceBuffer, CurrentOffset + 16) / 10430.2191955
 		return CFrame.fromEulerAnglesXYZ(EulerAngleX, EulerAngleY, EulerAngleZ) + Vector3.new(PositionX, PositionY, PositionZ), CurrentOffset + 18
 	end
 } :: TypeSerializer<CFrame>
@@ -420,39 +378,35 @@ DataTypes.CFrame = {
 DataTypes.CFramePosition = {
 	IsDynamic = false, ContainsInstances = false,
 	GetByteSize = function(_ : CFrame) : number return 12 end,
-	Write = function(TargetBuffer : buffer, CurrentOffset : number, ValueToWrite : CFrame) : number
-		buffer.writef32(TargetBuffer, CurrentOffset, ValueToWrite.X)
-		buffer.writef32(TargetBuffer, CurrentOffset + 4, ValueToWrite.Y)
-		buffer.writef32(TargetBuffer, CurrentOffset + 8, ValueToWrite.Z)
+	Write = function(TargetBuffer: buffer, CurrentOffset: number, ValueToWrite: CFrame)
+		BufferWriteF32(TargetBuffer, CurrentOffset, ValueToWrite.X)
+		BufferWriteF32(TargetBuffer, CurrentOffset + 4, ValueToWrite.Y)
+		BufferWriteF32(TargetBuffer, CurrentOffset + 8, ValueToWrite.Z)
 		return CurrentOffset + 12
 	end,
-	Read = function(SourceBuffer : buffer, CurrentOffset : number) : (CFrame, number)
-		return CFrame.new(
-			buffer.readf32(SourceBuffer, CurrentOffset),
-			buffer.readf32(SourceBuffer, CurrentOffset + 4),
-			buffer.readf32(SourceBuffer, CurrentOffset + 8)
-		), CurrentOffset + 12
+	Read = function(SourceBuffer, CurrentOffset)
+		return CFrame.new(BufferReadF32(SourceBuffer, CurrentOffset), BufferReadF32(SourceBuffer, CurrentOffset + 4), BufferReadF32(SourceBuffer, CurrentOffset + 8)), CurrentOffset + 12
 	end
 } :: TypeSerializer<CFrame>
 
 DataTypes.CFrameFloat16 = {
 	IsDynamic = false, ContainsInstances = false,
 	GetByteSize = function(_ : CFrame) : number return 12 end,
-	Write = function(TargetBuffer : buffer, CurrentOffset : number, ValueToWrite : CFrame) : number
+	Write = function(TargetBuffer: buffer, CurrentOffset: number, ValueToWrite: CFrame)
 		WriteFloat16(TargetBuffer, CurrentOffset, ValueToWrite.X)
 		WriteFloat16(TargetBuffer, CurrentOffset + 2, ValueToWrite.Y)
 		WriteFloat16(TargetBuffer, CurrentOffset + 4, ValueToWrite.Z)
 		local EulerAngleX, EulerAngleY, EulerAngleZ = ValueToWrite:ToEulerAnglesXYZ()
-		buffer.writeu16(TargetBuffer, CurrentOffset + 6, EulerAngleX * 10430.2191955 + 0.5)
-		buffer.writeu16(TargetBuffer, CurrentOffset + 8, EulerAngleY * 10430.2191955 + 0.5)
-		buffer.writeu16(TargetBuffer, CurrentOffset + 10, EulerAngleZ * 10430.2191955 + 0.5)
+		BufferWriteU16(TargetBuffer, CurrentOffset + 6, EulerAngleX * 10430.2191955 + 0.5)
+		BufferWriteU16(TargetBuffer, CurrentOffset + 8, EulerAngleY * 10430.2191955 + 0.5)
+		BufferWriteU16(TargetBuffer, CurrentOffset + 10, EulerAngleZ * 10430.2191955 + 0.5)
 		return CurrentOffset + 12
 	end,
-	Read = function(SourceBuffer : buffer, CurrentOffset : number) : (CFrame, number)
+	Read = function(SourceBuffer, CurrentOffset)
 		local PositionX = ReadFloat16(SourceBuffer, CurrentOffset)
 		local PositionY = ReadFloat16(SourceBuffer, CurrentOffset + 2)
 		local PositionZ = ReadFloat16(SourceBuffer, CurrentOffset + 4)
-		local EulerAngleX, EulerAngleY, EulerAngleZ = buffer.readu16(SourceBuffer, CurrentOffset + 6) / 10430.2191955, buffer.readu16(SourceBuffer, CurrentOffset + 8) / 10430.2191955, buffer.readu16(SourceBuffer, CurrentOffset + 10) / 10430.2191955
+		local EulerAngleX, EulerAngleY, EulerAngleZ = BufferReadU16(SourceBuffer, CurrentOffset + 6) / 10430.2191955, BufferReadU16(SourceBuffer, CurrentOffset + 8) / 10430.2191955, BufferReadU16(SourceBuffer, CurrentOffset + 10) / 10430.2191955
 		return CFrame.fromEulerAnglesXYZ(EulerAngleX, EulerAngleY, EulerAngleZ) + Vector3.new(PositionX, PositionY, PositionZ), CurrentOffset + 12
 	end
 } :: TypeSerializer<CFrame>
@@ -460,19 +414,19 @@ DataTypes.CFrameFloat16 = {
 DataTypes.CFrameInt16 = {
 	IsDynamic = false, ContainsInstances = false,
 	GetByteSize = function(_ : CFrame) : number return 12 end,
-	Write = function(TargetBuffer : buffer, CurrentOffset : number, ValueToWrite : CFrame) : number
-		buffer.writei16(TargetBuffer, CurrentOffset, math.round(ValueToWrite.X))
-		buffer.writei16(TargetBuffer, CurrentOffset + 2, math.round(ValueToWrite.Y))
-		buffer.writei16(TargetBuffer, CurrentOffset + 4, math.round(ValueToWrite.Z))
+	Write = function(TargetBuffer: buffer, CurrentOffset: number, ValueToWrite: CFrame)
+		BufferWriteI16(TargetBuffer, CurrentOffset, MathRound(ValueToWrite.X))
+		BufferWriteI16(TargetBuffer, CurrentOffset + 2, MathRound(ValueToWrite.Y))
+		BufferWriteI16(TargetBuffer, CurrentOffset + 4, MathRound(ValueToWrite.Z))
 		local EulerAngleX, EulerAngleY, EulerAngleZ = ValueToWrite:ToEulerAnglesXYZ()
-		buffer.writeu16(TargetBuffer, CurrentOffset + 6, EulerAngleX * 10430.2191955 + 0.5)
-		buffer.writeu16(TargetBuffer, CurrentOffset + 8, EulerAngleY * 10430.2191955 + 0.5)
-		buffer.writeu16(TargetBuffer, CurrentOffset + 10, EulerAngleZ * 10430.2191955 + 0.5)
+		BufferWriteU16(TargetBuffer, CurrentOffset + 6, EulerAngleX * 10430.2191955 + 0.5)
+		BufferWriteU16(TargetBuffer, CurrentOffset + 8, EulerAngleY * 10430.2191955 + 0.5)
+		BufferWriteU16(TargetBuffer, CurrentOffset + 10, EulerAngleZ * 10430.2191955 + 0.5)
 		return CurrentOffset + 12
 	end,
-	Read = function(SourceBuffer : buffer, CurrentOffset : number) : (CFrame, number)
-		local PositionX, PositionY, PositionZ = buffer.readi16(SourceBuffer, CurrentOffset), buffer.readi16(SourceBuffer, CurrentOffset + 2), buffer.readi16(SourceBuffer, CurrentOffset + 4)
-		local EulerAngleX, EulerAngleY, EulerAngleZ = buffer.readu16(SourceBuffer, CurrentOffset + 6) / 10430.2191955, buffer.readu16(SourceBuffer, CurrentOffset + 8) / 10430.2191955, buffer.readu16(SourceBuffer, CurrentOffset + 10) / 10430.2191955
+	Read = function(SourceBuffer, CurrentOffset)
+		local PositionX, PositionY, PositionZ = BufferReadI16(SourceBuffer, CurrentOffset), BufferReadI16(SourceBuffer, CurrentOffset + 2), BufferReadI16(SourceBuffer, CurrentOffset + 4)
+		local EulerAngleX, EulerAngleY, EulerAngleZ = BufferReadU16(SourceBuffer, CurrentOffset + 6) / 10430.2191955, BufferReadU16(SourceBuffer, CurrentOffset + 8) / 10430.2191955, BufferReadU16(SourceBuffer, CurrentOffset + 10) / 10430.2191955
 		return CFrame.fromEulerAnglesXYZ(EulerAngleX, EulerAngleY, EulerAngleZ) + Vector3.new(PositionX, PositionY, PositionZ), CurrentOffset + 12
 	end
 } :: TypeSerializer<CFrame>
@@ -480,19 +434,19 @@ DataTypes.CFrameInt16 = {
 DataTypes.CFrameHighPrecision = {
 	IsDynamic = false, ContainsInstances = false,
 	GetByteSize = function(_ : CFrame) : number return 30 end,
-	Write = function(TargetBuffer : buffer, CurrentOffset : number, ValueToWrite : CFrame) : number
-		buffer.writef64(TargetBuffer, CurrentOffset, ValueToWrite.X)
-		buffer.writef64(TargetBuffer, CurrentOffset + 8, ValueToWrite.Y)
-		buffer.writef64(TargetBuffer, CurrentOffset + 16, ValueToWrite.Z)
+	Write = function(TargetBuffer: buffer, CurrentOffset: number, ValueToWrite: CFrame)
+		BufferWriteF64(TargetBuffer, CurrentOffset, ValueToWrite.X)
+		BufferWriteF64(TargetBuffer, CurrentOffset + 8, ValueToWrite.Y)
+		BufferWriteF64(TargetBuffer, CurrentOffset + 16, ValueToWrite.Z)
 		local EulerAngleX, EulerAngleY, EulerAngleZ = ValueToWrite:ToEulerAnglesXYZ()
-		buffer.writeu16(TargetBuffer, CurrentOffset + 24, EulerAngleX * 10430.2191955 + 0.5)
-		buffer.writeu16(TargetBuffer, CurrentOffset + 26, EulerAngleY * 10430.2191955 + 0.5)
-		buffer.writeu16(TargetBuffer, CurrentOffset + 28, EulerAngleZ * 10430.2191955 + 0.5)
+		BufferWriteU16(TargetBuffer, CurrentOffset + 24, EulerAngleX * 10430.2191955 + 0.5)
+		BufferWriteU16(TargetBuffer, CurrentOffset + 26, EulerAngleY * 10430.2191955 + 0.5)
+		BufferWriteU16(TargetBuffer, CurrentOffset + 28, EulerAngleZ * 10430.2191955 + 0.5)
 		return CurrentOffset + 30
 	end,
-	Read = function(SourceBuffer : buffer, CurrentOffset : number) : (CFrame, number)
-		local PositionX, PositionY, PositionZ = buffer.readf64(SourceBuffer, CurrentOffset), buffer.readf64(SourceBuffer, CurrentOffset + 8), buffer.readf64(SourceBuffer, CurrentOffset + 16)
-		local EulerAngleX, EulerAngleY, EulerAngleZ = buffer.readu16(SourceBuffer, CurrentOffset + 24) / 10430.2191955, buffer.readu16(SourceBuffer, CurrentOffset + 26) / 10430.2191955, buffer.readu16(SourceBuffer, CurrentOffset + 28) / 10430.2191955
+	Read = function(SourceBuffer, CurrentOffset)
+		local PositionX, PositionY, PositionZ = BufferReadF64(SourceBuffer, CurrentOffset), BufferReadF64(SourceBuffer, CurrentOffset + 8), BufferReadF64(SourceBuffer, CurrentOffset + 16)
+		local EulerAngleX, EulerAngleY, EulerAngleZ = BufferReadU16(SourceBuffer, CurrentOffset + 24) / 10430.2191955, BufferReadU16(SourceBuffer, CurrentOffset + 26) / 10430.2191955, BufferReadU16(SourceBuffer, CurrentOffset + 28) / 10430.2191955
 		return CFrame.fromEulerAnglesXYZ(EulerAngleX, EulerAngleY, EulerAngleZ) + Vector3.new(PositionX, PositionY, PositionZ), CurrentOffset + 30
 	end
 } :: TypeSerializer<CFrame>
@@ -500,77 +454,73 @@ DataTypes.CFrameHighPrecision = {
 DataTypes.Color3 = {
 	IsDynamic = false, ContainsInstances = false,
 	GetByteSize = function(_ : Color3) : number return 3 end,
-	Write = function(TargetBuffer : buffer, CurrentOffset : number, ValueToWrite : Color3) : number
-		buffer.writeu8(TargetBuffer, CurrentOffset, math.round(ValueToWrite.R * 255))
-		buffer.writeu8(TargetBuffer, CurrentOffset+1, math.round(ValueToWrite.G * 255))
-		buffer.writeu8(TargetBuffer, CurrentOffset+2, math.round(ValueToWrite.B * 255))
+	Write = function(TargetBuffer, CurrentOffset, ValueToWrite: Color3)
+		BufferWriteU8(TargetBuffer, CurrentOffset, MathRound(ValueToWrite.R * 255))
+		BufferWriteU8(TargetBuffer, CurrentOffset+1, MathRound(ValueToWrite.G * 255))
+		BufferWriteU8(TargetBuffer, CurrentOffset+2, MathRound(ValueToWrite.B * 255))
 		return CurrentOffset + 3
 	end,
-	Read = function(SourceBuffer : buffer, CurrentOffset : number) : (Color3, number)
-		return Color3.fromRGB(
-			buffer.readu8(SourceBuffer, CurrentOffset), 
-			buffer.readu8(SourceBuffer, CurrentOffset+1), 
-			buffer.readu8(SourceBuffer, CurrentOffset+2)
-		), CurrentOffset + 3 
+	Read = function(SourceBuffer, CurrentOffset)
+		return Color3.fromRGB(BufferReadU8(SourceBuffer, CurrentOffset), BufferReadU8(SourceBuffer, CurrentOffset+1), BufferReadU8(SourceBuffer, CurrentOffset+2)), CurrentOffset + 3 
 	end
 } :: TypeSerializer<Color3>
 
 DataTypes.String = {
 	IsDynamic = true, ContainsInstances = false,
 	GetByteSize = function(ValueToWrite : string) : number return 2 + #ValueToWrite end,
-	Write = function(TargetBuffer : buffer, CurrentOffset : number, ValueToWrite : string) : number
+	Write = function(TargetBuffer, CurrentOffset, ValueToWrite)
 		local StringLength = #ValueToWrite
-		buffer.writeu16(TargetBuffer, CurrentOffset, StringLength)
-		buffer.writestring(TargetBuffer, CurrentOffset + 2, ValueToWrite)
+		BufferWriteU16(TargetBuffer, CurrentOffset, StringLength)
+		BufferWriteString(TargetBuffer, CurrentOffset + 2, ValueToWrite)
 		return CurrentOffset + 2 + StringLength
 	end,
-	Read = function(SourceBuffer : buffer, CurrentOffset : number) : (string, number)
-		local StringLength = buffer.readu16(SourceBuffer, CurrentOffset)
-		return buffer.readstring(SourceBuffer, CurrentOffset + 2, StringLength), CurrentOffset + 2 + StringLength
+	Read = function(SourceBuffer, CurrentOffset)
+		local StringLength = BufferReadU16(SourceBuffer, CurrentOffset)
+		return BufferReadString(SourceBuffer, CurrentOffset + 2, StringLength), CurrentOffset + 2 + StringLength
 	end
 } :: TypeSerializer<string>
 
 DataTypes.ShortString = {
 	IsDynamic = true, ContainsInstances = false,
 	GetByteSize = function(ValueToWrite : string) : number return 1 + #ValueToWrite end,
-	Write = function(TargetBuffer : buffer, CurrentOffset : number, ValueToWrite : string) : number
+	Write = function(TargetBuffer, CurrentOffset, ValueToWrite)
 		local StringLength = #ValueToWrite
-		buffer.writeu8(TargetBuffer, CurrentOffset, StringLength)
-		buffer.writestring(TargetBuffer, CurrentOffset + 1, ValueToWrite)
+		BufferWriteU8(TargetBuffer, CurrentOffset, StringLength)
+		BufferWriteString(TargetBuffer, CurrentOffset + 1, ValueToWrite)
 		return CurrentOffset + 1 + StringLength
 	end,
-	Read = function(SourceBuffer : buffer, CurrentOffset : number) : (string, number)
-		local StringLength = buffer.readu8(SourceBuffer, CurrentOffset)
-		return buffer.readstring(SourceBuffer, CurrentOffset + 1, StringLength), CurrentOffset + 1 + StringLength
+	Read = function(SourceBuffer, CurrentOffset)
+		local StringLength = BufferReadU8(SourceBuffer, CurrentOffset)
+		return BufferReadString(SourceBuffer, CurrentOffset + 1, StringLength), CurrentOffset + 1 + StringLength
 	end
 } :: TypeSerializer<string>
 
 DataTypes.RestOfString = {
 	IsDynamic = true, ContainsInstances = false,
 	GetByteSize = function(ValueToWrite : string) : number return #ValueToWrite end,
-	Write = function(TargetBuffer : buffer, CurrentOffset : number, ValueToWrite : string) : number
-		buffer.writestring(TargetBuffer, CurrentOffset, ValueToWrite)
+	Write = function(TargetBuffer, CurrentOffset, ValueToWrite)
+		BufferWriteString(TargetBuffer, CurrentOffset, ValueToWrite)
 		return CurrentOffset + #ValueToWrite
 	end,
-	Read = function(SourceBuffer : buffer, CurrentOffset : number) : (string, number)
-		local RemainingLength = buffer.len(SourceBuffer) - CurrentOffset
-		return buffer.readstring(SourceBuffer, CurrentOffset, RemainingLength), CurrentOffset + RemainingLength
+	Read = function(SourceBuffer, CurrentOffset)
+		local RemainingLength = BufferLen(SourceBuffer) - CurrentOffset
+		return BufferReadString(SourceBuffer, CurrentOffset, RemainingLength), CurrentOffset + RemainingLength
 	end
 } :: TypeSerializer<string>
 
 DataTypes.Buffer = {
 	IsDynamic = true, ContainsInstances = false,
-	GetByteSize = function(ValueToWrite : buffer) : number return 2 + buffer.len(ValueToWrite) end,
-	Write = function(TargetBuffer : buffer, CurrentOffset : number, ValueToWrite : buffer) : number
-		local BufferLength = buffer.len(ValueToWrite)
-		buffer.writeu16(TargetBuffer, CurrentOffset, BufferLength)
-		buffer.copy(TargetBuffer, CurrentOffset + 2, ValueToWrite, 0, BufferLength)
+	GetByteSize = function(ValueToWrite : buffer) : number return 2 + BufferLen(ValueToWrite) end,
+	Write = function(TargetBuffer, CurrentOffset, ValueToWrite)
+		local BufferLength = BufferLen(ValueToWrite)
+		BufferWriteU16(TargetBuffer, CurrentOffset, BufferLength)
+		BufferCopy(TargetBuffer, CurrentOffset + 2, ValueToWrite, 0, BufferLength)
 		return CurrentOffset + 2 + BufferLength
 	end,
-	Read = function(SourceBuffer : buffer, CurrentOffset : number) : (buffer, number)
-		local BufferLength = buffer.readu16(SourceBuffer, CurrentOffset)
-		local NewBuffer = buffer.create(BufferLength)
-		buffer.copy(NewBuffer, 0, SourceBuffer, CurrentOffset + 2, BufferLength)
+	Read = function(SourceBuffer, CurrentOffset)
+		local BufferLength = BufferReadU16(SourceBuffer, CurrentOffset)
+		local NewBuffer = BufferCreate(BufferLength)
+		BufferCopy(NewBuffer, 0, SourceBuffer, CurrentOffset + 2, BufferLength)
 		return NewBuffer, CurrentOffset + 2 + BufferLength
 	end
 } :: TypeSerializer<buffer>
@@ -579,64 +529,68 @@ function DataTypes.FixedString(StringLength : number) : TypeSerializer<string>
 	return {
 		IsDynamic = false, ContainsInstances = false,
 		GetByteSize = function(_ : string) : number return StringLength end,
-		Write = function(TargetBuffer : buffer, CurrentOffset : number, ValueToWrite : string) : number 
-			buffer.writestring(TargetBuffer, CurrentOffset, ValueToWrite, StringLength) 
+		Write = function(TargetBuffer, CurrentOffset, ValueToWrite) 
+			BufferWriteString(TargetBuffer, CurrentOffset, ValueToWrite, StringLength) 
 			return CurrentOffset + StringLength 
 		end,
-		Read = function(SourceBuffer : buffer, CurrentOffset : number) : (string, number) 
-			return buffer.readstring(SourceBuffer, CurrentOffset, StringLength), CurrentOffset + StringLength 
+		Read = function(SourceBuffer, CurrentOffset) 
+			return BufferReadString(SourceBuffer, CurrentOffset, StringLength), CurrentOffset + StringLength 
 		end
 	}
 end
 
 function DataTypes.Optional<ValueType>(InnerType : TypeSerializer<ValueType>) : TypeSerializer<ValueType?>
+	local InnerWrite, InnerRead, InnerSize = InnerType.Write, InnerType.Read, InnerType.GetByteSize
 	return {
 		IsDynamic = true, ContainsInstances = InnerType.ContainsInstances,
-		GetByteSize = function(ValueToWrite : ValueType?) : number return if ValueToWrite == nil then 1 else 1 + InnerType.GetByteSize(ValueToWrite) end,
-		Write = function(TargetBuffer : buffer, CurrentOffset : number, ValueToWrite : ValueType?, InstanceAccumulator : {Instance}?, InstanceLookup : {[Instance]: number}?) : number
+		GetByteSize = function(ValueToWrite) return if ValueToWrite == nil then 1 else 1 + InnerSize(ValueToWrite) end,
+		Write = function(TargetBuffer, CurrentOffset, ValueToWrite, InstanceAccumulator, InstanceLookup)
 			if ValueToWrite == nil then
-				buffer.writeu8(TargetBuffer, CurrentOffset, 0)
+				BufferWriteU8(TargetBuffer, CurrentOffset, 0)
 				return CurrentOffset + 1
 			else
-				buffer.writeu8(TargetBuffer, CurrentOffset, 1)
-				return InnerType.Write(TargetBuffer, CurrentOffset + 1, ValueToWrite, InstanceAccumulator, InstanceLookup)
+				BufferWriteU8(TargetBuffer, CurrentOffset, 1)
+				return InnerWrite(TargetBuffer, CurrentOffset + 1, ValueToWrite, InstanceAccumulator, InstanceLookup)
 			end
 		end,
-		Read = function(SourceBuffer : buffer, CurrentOffset : number, InstanceSource : {Instance}?) : (ValueType?, number)
-			if buffer.readu8(SourceBuffer, CurrentOffset) == 0 then return nil, CurrentOffset + 1
-			else return InnerType.Read(SourceBuffer, CurrentOffset + 1, InstanceSource) end
+		Read = function(SourceBuffer, CurrentOffset, InstanceSource)
+			if BufferReadU8(SourceBuffer, CurrentOffset) == 0 then return nil, CurrentOffset + 1
+			else return InnerRead(SourceBuffer, CurrentOffset + 1, InstanceSource) end
 		end
 	}
 end
 
 function DataTypes.Array<ValueType>(InnerType : TypeSerializer<ValueType>) : TypeSerializer<{ValueType}>
+	local InnerWrite, InnerRead, InnerSize = InnerType.Write, InnerType.Read, InnerType.GetByteSize
+	local IsInnerDynamic = InnerType.IsDynamic
+
 	return {
 		IsDynamic = true, ContainsInstances = InnerType.ContainsInstances,
-		GetByteSize = function(ValuesToWrite : {ValueType}) : number
+		GetByteSize = function(ValuesToWrite)
 			local TotalSize = 2
-			if InnerType.IsDynamic then
-				for _, Item in ipairs(ValuesToWrite) do TotalSize += InnerType.GetByteSize(Item) end
+			if IsInnerDynamic then
+				for _, Item in ipairs(ValuesToWrite) do TotalSize += InnerSize(Item) end
 			else
-				TotalSize += (#ValuesToWrite * InnerType.GetByteSize(nil :: any))
+				TotalSize += (#ValuesToWrite * InnerSize(nil :: any))
 			end
 			return TotalSize
 		end,
-		Write = function(TargetBuffer : buffer, CurrentOffset : number, ValuesToWrite : {ValueType}, InstanceAccumulator : {Instance}?, InstanceLookup : {[Instance]: number}?) : number
+		Write = function(TargetBuffer, CurrentOffset, ValuesToWrite, InstanceAccumulator, InstanceLookup)
 			local ItemCount = #ValuesToWrite
-			buffer.writeu16(TargetBuffer, CurrentOffset, ItemCount)
+			BufferWriteU16(TargetBuffer, CurrentOffset, ItemCount)
 			CurrentOffset += 2
 			for Index = 1, ItemCount do 
-				CurrentOffset = InnerType.Write(TargetBuffer, CurrentOffset, ValuesToWrite[Index], InstanceAccumulator, InstanceLookup) 
+				CurrentOffset = InnerWrite(TargetBuffer, CurrentOffset, ValuesToWrite[Index], InstanceAccumulator, InstanceLookup) 
 			end
 			return CurrentOffset
 		end,
-		Read = function(SourceBuffer : buffer, CurrentOffset : number, InstanceSource : {Instance}?) : ({ValueType}, number)
-			local ItemCount = buffer.readu16(SourceBuffer, CurrentOffset)
+		Read = function(SourceBuffer, CurrentOffset, InstanceSource)
+			local ItemCount = BufferReadU16(SourceBuffer, CurrentOffset)
 			CurrentOffset += 2
 			local ResultTable = table.create(ItemCount)
 			for Index = 1, ItemCount do
 				local DecodedValue
-				DecodedValue, CurrentOffset = InnerType.Read(SourceBuffer, CurrentOffset, InstanceSource)
+				DecodedValue, CurrentOffset = InnerRead(SourceBuffer, CurrentOffset, InstanceSource)
 				ResultTable[Index] = DecodedValue
 			end
 			return ResultTable, CurrentOffset
@@ -645,34 +599,37 @@ function DataTypes.Array<ValueType>(InnerType : TypeSerializer<ValueType>) : Typ
 end
 
 function DataTypes.Map<KeyType, ValueType>(KeyTypeSerializer : TypeSerializer<KeyType>, ValueTypeSerializer : TypeSerializer<ValueType>) : TypeSerializer<{[KeyType]: ValueType}>
+	local KeyWrite, KeyRead, KeySize = KeyTypeSerializer.Write, KeyTypeSerializer.Read, KeyTypeSerializer.GetByteSize
+	local ValWrite, ValRead, ValSize = ValueTypeSerializer.Write, ValueTypeSerializer.Read, ValueTypeSerializer.GetByteSize
+
 	return {
 		IsDynamic = true, ContainsInstances = KeyTypeSerializer.ContainsInstances or ValueTypeSerializer.ContainsInstances,
-		GetByteSize = function(MapValues : {[KeyType]: ValueType}) : number
+		GetByteSize = function(MapValues)
 			local TotalSize = 2 
 			for Key, Value in pairs(MapValues) do
-				TotalSize += KeyTypeSerializer.GetByteSize(Key)
-				TotalSize += ValueTypeSerializer.GetByteSize(Value)
+				TotalSize += KeySize(Key)
+				TotalSize += ValSize(Value)
 			end
 			return TotalSize
 		end,
-		Write = function(TargetBuffer : buffer, CurrentOffset : number, MapValues : {[KeyType]: ValueType}, InstanceAccumulator : {Instance}?, InstanceLookup : {[Instance]: number}?) : number
+		Write = function(TargetBuffer, CurrentOffset, MapValues, InstanceAccumulator, InstanceLookup)
 			local MapCount = 0; for _ in pairs(MapValues) do MapCount += 1 end
-			buffer.writeu16(TargetBuffer, CurrentOffset, MapCount)
+			BufferWriteU16(TargetBuffer, CurrentOffset, MapCount)
 			CurrentOffset += 2
 			for Key, Value in pairs(MapValues) do
-				CurrentOffset = KeyTypeSerializer.Write(TargetBuffer, CurrentOffset, Key, InstanceAccumulator, InstanceLookup)
-				CurrentOffset = ValueTypeSerializer.Write(TargetBuffer, CurrentOffset, Value, InstanceAccumulator, InstanceLookup)
+				CurrentOffset = KeyWrite(TargetBuffer, CurrentOffset, Key, InstanceAccumulator, InstanceLookup)
+				CurrentOffset = ValWrite(TargetBuffer, CurrentOffset, Value, InstanceAccumulator, InstanceLookup)
 			end
 			return CurrentOffset
 		end,
-		Read = function(SourceBuffer : buffer, CurrentOffset : number, InstanceSource : {Instance}?) : ({[KeyType]: ValueType}, number)
-			local MapCount = buffer.readu16(SourceBuffer, CurrentOffset)
+		Read = function(SourceBuffer, CurrentOffset, InstanceSource)
+			local MapCount = BufferReadU16(SourceBuffer, CurrentOffset)
 			CurrentOffset += 2
 			local ResultMap = {}
 			for _ = 1, MapCount do
 				local DecodedKey, DecodedValue
-				DecodedKey, CurrentOffset = KeyTypeSerializer.Read(SourceBuffer, CurrentOffset, InstanceSource)
-				DecodedValue, CurrentOffset = ValueTypeSerializer.Read(SourceBuffer, CurrentOffset, InstanceSource)
+				DecodedKey, CurrentOffset = KeyRead(SourceBuffer, CurrentOffset, InstanceSource)
+				DecodedValue, CurrentOffset = ValRead(SourceBuffer, CurrentOffset, InstanceSource)
 				ResultMap[DecodedKey] = DecodedValue
 			end
 			return ResultMap, CurrentOffset
@@ -692,25 +649,33 @@ function DataTypes.Struct(StructureDefinition: {[string]: TypeSerializer}) : Typ
 	end
 	table.sort(SortedKeys)
 
+	local FieldWriters, FieldReaders, FieldSizers = {}, {}, {}
+	for Index, Key in ipairs(SortedKeys) do
+		local Serializer = StructureDefinition[Key]
+		FieldWriters[Index] = Serializer.Write
+		FieldReaders[Index] = Serializer.Read
+		FieldSizers[Index] = Serializer.GetByteSize
+	end
+
 	return {
 		IsDynamic = IsDynamic, ContainsInstances = HasInstances,
-		GetByteSize = function(ValueToWrite : {[string]: any}) : number
+		GetByteSize = function(ValueToWrite)
 			local TotalSize = 0
-			for _, DefinitionKey in ipairs(SortedKeys) do
-				TotalSize += StructureDefinition[DefinitionKey].GetByteSize(ValueToWrite[DefinitionKey])
+			for Index, DefinitionKey in ipairs(SortedKeys) do
+				TotalSize += FieldSizers[Index](ValueToWrite[DefinitionKey])
 			end
 			return TotalSize
 		end,
-		Write = function(TargetBuffer : buffer, CurrentOffset : number, ValueToWrite : {[string]: any}, InstanceAccumulator : {Instance}?, InstanceLookup : {[Instance]: number}?) : number
-			for _, DefinitionKey in ipairs(SortedKeys) do
-				CurrentOffset = StructureDefinition[DefinitionKey].Write(TargetBuffer, CurrentOffset, ValueToWrite[DefinitionKey], InstanceAccumulator, InstanceLookup)
+		Write = function(TargetBuffer, CurrentOffset, ValueToWrite, InstanceAccumulator, InstanceLookup)
+			for Index, DefinitionKey in ipairs(SortedKeys) do
+				CurrentOffset = FieldWriters[Index](TargetBuffer, CurrentOffset, ValueToWrite[DefinitionKey], InstanceAccumulator, InstanceLookup)
 			end
 			return CurrentOffset
 		end,
-		Read = function(SourceBuffer : buffer, CurrentOffset : number, InstanceSource : {Instance}?) : ({[string]: any}, number)
+		Read = function(SourceBuffer, CurrentOffset, InstanceSource)
 			local ResultTable = {}
-			for _, DefinitionKey in ipairs(SortedKeys) do
-				ResultTable[DefinitionKey], CurrentOffset = StructureDefinition[DefinitionKey].Read(SourceBuffer, CurrentOffset, InstanceSource)
+			for Index, DefinitionKey in ipairs(SortedKeys) do
+				ResultTable[DefinitionKey], CurrentOffset = FieldReaders[Index](SourceBuffer, CurrentOffset, InstanceSource)
 			end
 			return ResultTable, CurrentOffset
 		end
@@ -831,7 +796,7 @@ do
 		elseif ValueType == "Instance" then
 			return 3
 		elseif ValueType == "buffer" then
-			local BufferLength = buffer.len(ValueToCheck)
+			local BufferLength = BufferLen(ValueToCheck)
 			return if BufferLength < 65536 then 3 + BufferLength else 5 + BufferLength
 		else
 			error("Ion: Unsupported type in Any serializer: " .. ValueType)
@@ -841,97 +806,97 @@ do
 	WriteAny = function(TargetBuffer: buffer, CurrentOffset: number, ValueToWrite: any, InstanceAccumulator: {Instance}?, InstanceLookup: {[Instance]: number}?) : number
 		local ValueType = typeof(ValueToWrite)
 		if ValueType == "Instance" then
-			buffer.writeu8(TargetBuffer, CurrentOffset, DATA_TYPE_INSTANCE)
+			BufferWriteU8(TargetBuffer, CurrentOffset, DATA_TYPE_INSTANCE)
 			if InstanceAccumulator and InstanceLookup then
 				local ExistingIndex = InstanceLookup[ValueToWrite :: Instance]
 				if ExistingIndex then
-					buffer.writeu16(TargetBuffer, CurrentOffset + 1, ExistingIndex)
+					BufferWriteU16(TargetBuffer, CurrentOffset + 1, ExistingIndex)
 				else
 					local NewIndex = #InstanceAccumulator + 1
 					InstanceAccumulator[NewIndex] = ValueToWrite :: Instance
 					InstanceLookup[ValueToWrite :: Instance] = NewIndex
-					buffer.writeu16(TargetBuffer, CurrentOffset + 1, NewIndex)
+					BufferWriteU16(TargetBuffer, CurrentOffset + 1, NewIndex)
 				end
 			else
-				buffer.writeu16(TargetBuffer, CurrentOffset + 1, 0)
+				BufferWriteU16(TargetBuffer, CurrentOffset + 1, 0)
 			end
 			return CurrentOffset + 3
 		elseif ValueType == "string" then
 			local StringLength = #ValueToWrite
 			if StringLength < 128 then
-				buffer.writeu8(TargetBuffer, CurrentOffset, OFFSET_STRING_SHORT + StringLength)
-				buffer.writestring(TargetBuffer, CurrentOffset + 1, ValueToWrite)
+				BufferWriteU8(TargetBuffer, CurrentOffset, OFFSET_STRING_SHORT + StringLength)
+				BufferWriteString(TargetBuffer, CurrentOffset + 1, ValueToWrite)
 				return CurrentOffset + 1 + StringLength
 			else
-				buffer.writeu8(TargetBuffer, CurrentOffset, DATA_TYPE_STRING_LONG)
-				buffer.writeu32(TargetBuffer, CurrentOffset + 1, StringLength)
-				buffer.writestring(TargetBuffer, CurrentOffset + 5, ValueToWrite)
+				BufferWriteU8(TargetBuffer, CurrentOffset, DATA_TYPE_STRING_LONG)
+				BufferWriteU32(TargetBuffer, CurrentOffset + 1, StringLength)
+				BufferWriteString(TargetBuffer, CurrentOffset + 5, ValueToWrite)
 				return CurrentOffset + 5 + StringLength
 			end
 		elseif ValueType == "number" then
 			if ValueToWrite % 1 == 0 then
 				if ValueToWrite >= -128 and ValueToWrite <= 127 then
-					buffer.writeu8(TargetBuffer, CurrentOffset, DATA_TYPE_INT8)
-					buffer.writei8(TargetBuffer, CurrentOffset + 1, ValueToWrite)
+					BufferWriteU8(TargetBuffer, CurrentOffset, DATA_TYPE_INT8)
+					BufferWriteI8(TargetBuffer, CurrentOffset + 1, ValueToWrite)
 					return CurrentOffset + 2
 				elseif ValueToWrite >= -32768 and ValueToWrite <= 32767 then
-					buffer.writeu8(TargetBuffer, CurrentOffset, DATA_TYPE_INT16)
-					buffer.writei16(TargetBuffer, CurrentOffset + 1, ValueToWrite)
+					BufferWriteU8(TargetBuffer, CurrentOffset, DATA_TYPE_INT16)
+					BufferWriteI16(TargetBuffer, CurrentOffset + 1, ValueToWrite)
 					return CurrentOffset + 3
 				elseif ValueToWrite >= -2147483648 and ValueToWrite <= 2147483647 then
-					buffer.writeu8(TargetBuffer, CurrentOffset, DATA_TYPE_INT32)
-					buffer.writei32(TargetBuffer, CurrentOffset + 1, ValueToWrite)
+					BufferWriteU8(TargetBuffer, CurrentOffset, DATA_TYPE_INT32)
+					BufferWriteI32(TargetBuffer, CurrentOffset + 1, ValueToWrite)
 					return CurrentOffset + 5
 				end
 			end
-			buffer.writeu8(TargetBuffer, CurrentOffset, DATA_TYPE_F64)
-			buffer.writef64(TargetBuffer, CurrentOffset + 1, ValueToWrite)
+			BufferWriteU8(TargetBuffer, CurrentOffset, DATA_TYPE_F64)
+			BufferWriteF64(TargetBuffer, CurrentOffset + 1, ValueToWrite)
 			return CurrentOffset + 9
 		elseif ValueType == "Vector3" then
 			if ValueToWrite == Vector3.zero then
-				buffer.writeu8(TargetBuffer, CurrentOffset, DATA_TYPE_VECTOR3_ZERO)
+				BufferWriteU8(TargetBuffer, CurrentOffset, DATA_TYPE_VECTOR3_ZERO)
 				return CurrentOffset + 1
 			elseif ValueToWrite == Vector3.one then
-				buffer.writeu8(TargetBuffer, CurrentOffset, DATA_TYPE_VECTOR3_ONE)
+				BufferWriteU8(TargetBuffer, CurrentOffset, DATA_TYPE_VECTOR3_ONE)
 				return CurrentOffset + 1
 			end
 
 			local VectorX, VectorY, VectorZ = ValueToWrite.X, ValueToWrite.Y, ValueToWrite.Z
 			if VectorX % 1 == 0 and VectorY % 1 == 0 and VectorZ % 1 == 0 then
 				if VectorX >= -128 and VectorX <= 127 and VectorY >= -128 and VectorY <= 127 and VectorZ >= -128 and VectorZ <= 127 then
-					buffer.writeu8(TargetBuffer, CurrentOffset, DATA_TYPE_VECTOR3_INT8)
-					buffer.writei8(TargetBuffer, CurrentOffset + 1, VectorX)
-					buffer.writei8(TargetBuffer, CurrentOffset + 2, VectorY)
-					buffer.writei8(TargetBuffer, CurrentOffset + 3, VectorZ)
+					BufferWriteU8(TargetBuffer, CurrentOffset, DATA_TYPE_VECTOR3_INT8)
+					BufferWriteI8(TargetBuffer, CurrentOffset + 1, VectorX)
+					BufferWriteI8(TargetBuffer, CurrentOffset + 2, VectorY)
+					BufferWriteI8(TargetBuffer, CurrentOffset + 3, VectorZ)
 					return CurrentOffset + 4
 				elseif VectorX >= -32768 and VectorX <= 32767 and VectorY >= -32768 and VectorY <= 32767 and VectorZ >= -32768 and VectorZ <= 32767 then
-					buffer.writeu8(TargetBuffer, CurrentOffset, DATA_TYPE_VECTOR3_INT16)
-					buffer.writei16(TargetBuffer, CurrentOffset + 1, VectorX)
-					buffer.writei16(TargetBuffer, CurrentOffset + 3, VectorY)
-					buffer.writei16(TargetBuffer, CurrentOffset + 5, VectorZ)
+					BufferWriteU8(TargetBuffer, CurrentOffset, DATA_TYPE_VECTOR3_INT16)
+					BufferWriteI16(TargetBuffer, CurrentOffset + 1, VectorX)
+					BufferWriteI16(TargetBuffer, CurrentOffset + 3, VectorY)
+					BufferWriteI16(TargetBuffer, CurrentOffset + 5, VectorZ)
 					return CurrentOffset + 7
 				end
 			end
-			buffer.writeu8(TargetBuffer, CurrentOffset, DATA_TYPE_VECTOR3)
-			buffer.writef32(TargetBuffer, CurrentOffset + 1, VectorX)
-			buffer.writef32(TargetBuffer, CurrentOffset + 5, VectorY)
-			buffer.writef32(TargetBuffer, CurrentOffset + 9, VectorZ)
+			BufferWriteU8(TargetBuffer, CurrentOffset, DATA_TYPE_VECTOR3)
+			BufferWriteF32(TargetBuffer, CurrentOffset + 1, VectorX)
+			BufferWriteF32(TargetBuffer, CurrentOffset + 5, VectorY)
+			BufferWriteF32(TargetBuffer, CurrentOffset + 9, VectorZ)
 			return CurrentOffset + 13
 		elseif ValueType == "boolean" then
-			buffer.writeu8(TargetBuffer, CurrentOffset, if ValueToWrite then DATA_TYPE_TRUE else DATA_TYPE_FALSE)
+			BufferWriteU8(TargetBuffer, CurrentOffset, if ValueToWrite then DATA_TYPE_TRUE else DATA_TYPE_FALSE)
 			return CurrentOffset + 1
 		elseif ValueType == "nil" then
-			buffer.writeu8(TargetBuffer, CurrentOffset, DATA_TYPE_NIL)
+			BufferWriteU8(TargetBuffer, CurrentOffset, DATA_TYPE_NIL)
 			return CurrentOffset + 1
 		elseif ValueType == "table" then
 			if IsTableArray(ValueToWrite) then
 				local ElementCount = #ValueToWrite
 				if ElementCount < 32 then
-					buffer.writeu8(TargetBuffer, CurrentOffset, OFFSET_ARRAY_SHORT + ElementCount)
+					BufferWriteU8(TargetBuffer, CurrentOffset, OFFSET_ARRAY_SHORT + ElementCount)
 					CurrentOffset += 1
 				else
-					buffer.writeu8(TargetBuffer, CurrentOffset, DATA_TYPE_ARRAY_LONG)
-					buffer.writeu16(TargetBuffer, CurrentOffset + 1, ElementCount)
+					BufferWriteU8(TargetBuffer, CurrentOffset, DATA_TYPE_ARRAY_LONG)
+					BufferWriteU16(TargetBuffer, CurrentOffset + 1, ElementCount)
 					CurrentOffset += 3
 				end
 				for Index = 1, ElementCount do CurrentOffset = WriteAny(TargetBuffer, CurrentOffset, ValueToWrite[Index], InstanceAccumulator, InstanceLookup) end
@@ -939,11 +904,11 @@ do
 			else
 				local ElementCount = 0; for _ in pairs(ValueToWrite) do ElementCount += 1 end
 				if ElementCount < 32 then
-					buffer.writeu8(TargetBuffer, CurrentOffset, OFFSET_MAP_SHORT + ElementCount)
+					BufferWriteU8(TargetBuffer, CurrentOffset, OFFSET_MAP_SHORT + ElementCount)
 					CurrentOffset += 1
 				else
-					buffer.writeu8(TargetBuffer, CurrentOffset, DATA_TYPE_MAP_LONG)
-					buffer.writeu16(TargetBuffer, CurrentOffset + 1, ElementCount)
+					BufferWriteU8(TargetBuffer, CurrentOffset, DATA_TYPE_MAP_LONG)
+					BufferWriteU16(TargetBuffer, CurrentOffset + 1, ElementCount)
 					CurrentOffset += 3
 				end
 				for Key, Value in pairs(ValueToWrite) do
@@ -958,29 +923,29 @@ do
 
 			if IsIdentityRotation then
 				if PositionX == 0 and PositionY == 0 and PositionZ == 0 then
-					buffer.writeu8(TargetBuffer, CurrentOffset, DATA_TYPE_CF_IDENTITY_ZERO)
+					BufferWriteU8(TargetBuffer, CurrentOffset, DATA_TYPE_CF_IDENTITY_ZERO)
 					return CurrentOffset + 1
 				end
 
 				if PositionX % 1 == 0 and PositionY % 1 == 0 and PositionZ % 1 == 0 then
 					if PositionX >= -128 and PositionX <= 127 and PositionY >= -128 and PositionY <= 127 and PositionZ >= -128 and PositionZ <= 127 then
-						buffer.writeu8(TargetBuffer, CurrentOffset, DATA_TYPE_CF_IDENTITY_INT8)
-						buffer.writei8(TargetBuffer, CurrentOffset + 1, PositionX)
-						buffer.writei8(TargetBuffer, CurrentOffset + 2, PositionY)
-						buffer.writei8(TargetBuffer, CurrentOffset + 3, PositionZ)
+						BufferWriteU8(TargetBuffer, CurrentOffset, DATA_TYPE_CF_IDENTITY_INT8)
+						BufferWriteI8(TargetBuffer, CurrentOffset + 1, PositionX)
+						BufferWriteI8(TargetBuffer, CurrentOffset + 2, PositionY)
+						BufferWriteI8(TargetBuffer, CurrentOffset + 3, PositionZ)
 						return CurrentOffset + 4
 					elseif PositionX >= -32768 and PositionX <= 32767 and PositionY >= -32768 and PositionY <= 32767 and PositionZ >= -32768 and PositionZ <= 32767 then
-						buffer.writeu8(TargetBuffer, CurrentOffset, DATA_TYPE_CF_IDENTITY_INT16)
-						buffer.writei16(TargetBuffer, CurrentOffset + 1, PositionX)
-						buffer.writei16(TargetBuffer, CurrentOffset + 3, PositionY)
-						buffer.writei16(TargetBuffer, CurrentOffset + 5, PositionZ)
+						BufferWriteU8(TargetBuffer, CurrentOffset, DATA_TYPE_CF_IDENTITY_INT16)
+						BufferWriteI16(TargetBuffer, CurrentOffset + 1, PositionX)
+						BufferWriteI16(TargetBuffer, CurrentOffset + 3, PositionY)
+						BufferWriteI16(TargetBuffer, CurrentOffset + 5, PositionZ)
 						return CurrentOffset + 7
 					end
 				end
-				buffer.writeu8(TargetBuffer, CurrentOffset, DATA_TYPE_CF_IDENTITY_F32)
-				buffer.writef32(TargetBuffer, CurrentOffset + 1, PositionX)
-				buffer.writef32(TargetBuffer, CurrentOffset + 5, PositionY)
-				buffer.writef32(TargetBuffer, CurrentOffset + 9, PositionZ)
+				BufferWriteU8(TargetBuffer, CurrentOffset, DATA_TYPE_CF_IDENTITY_F32)
+				BufferWriteF32(TargetBuffer, CurrentOffset + 1, PositionX)
+				BufferWriteF32(TargetBuffer, CurrentOffset + 5, PositionY)
+				BufferWriteF32(TargetBuffer, CurrentOffset + 9, PositionZ)
 				return CurrentOffset + 13
 			else
 				local EulerAngleX, EulerAngleY, EulerAngleZ = ValueToWrite:ToEulerAnglesXYZ()
@@ -990,44 +955,44 @@ do
 
 				if PositionX % 1 == 0 and PositionY % 1 == 0 and PositionZ % 1 == 0 then
 					if PositionX >= -128 and PositionX <= 127 and PositionY >= -128 and PositionY <= 127 and PositionZ >= -128 and PositionZ <= 127 then
-						buffer.writeu8(TargetBuffer, CurrentOffset, DATA_TYPE_CF_ROTATION_INT8)
-						buffer.writei8(TargetBuffer, CurrentOffset + 1, PositionX)
-						buffer.writei8(TargetBuffer, CurrentOffset + 2, PositionY)
-						buffer.writei8(TargetBuffer, CurrentOffset + 3, PositionZ)
-						buffer.writeu16(TargetBuffer, CurrentOffset + 4, EncodedRotationX)
-						buffer.writeu16(TargetBuffer, CurrentOffset + 6, EncodedRotationY)
-						buffer.writeu16(TargetBuffer, CurrentOffset + 8, EncodedRotationZ)
+						BufferWriteU8(TargetBuffer, CurrentOffset, DATA_TYPE_CF_ROTATION_INT8)
+						BufferWriteI8(TargetBuffer, CurrentOffset + 1, PositionX)
+						BufferWriteI8(TargetBuffer, CurrentOffset + 2, PositionY)
+						BufferWriteI8(TargetBuffer, CurrentOffset + 3, PositionZ)
+						BufferWriteU16(TargetBuffer, CurrentOffset + 4, EncodedRotationX)
+						BufferWriteU16(TargetBuffer, CurrentOffset + 6, EncodedRotationY)
+						BufferWriteU16(TargetBuffer, CurrentOffset + 8, EncodedRotationZ)
 						return CurrentOffset + 10
 					end
 				end
 
-				buffer.writeu8(TargetBuffer, CurrentOffset, DATA_TYPE_CF_ROTATION_F32)
-				buffer.writef32(TargetBuffer, CurrentOffset + 1, PositionX)
-				buffer.writef32(TargetBuffer, CurrentOffset + 5, PositionY)
-				buffer.writef32(TargetBuffer, CurrentOffset + 9, PositionZ)
-				buffer.writeu16(TargetBuffer, CurrentOffset + 13, EncodedRotationX)
-				buffer.writeu16(TargetBuffer, CurrentOffset + 15, EncodedRotationY)
-				buffer.writeu16(TargetBuffer, CurrentOffset + 17, EncodedRotationZ)
+				BufferWriteU8(TargetBuffer, CurrentOffset, DATA_TYPE_CF_ROTATION_F32)
+				BufferWriteF32(TargetBuffer, CurrentOffset + 1, PositionX)
+				BufferWriteF32(TargetBuffer, CurrentOffset + 5, PositionY)
+				BufferWriteF32(TargetBuffer, CurrentOffset + 9, PositionZ)
+				BufferWriteU16(TargetBuffer, CurrentOffset + 13, EncodedRotationX)
+				BufferWriteU16(TargetBuffer, CurrentOffset + 15, EncodedRotationY)
+				BufferWriteU16(TargetBuffer, CurrentOffset + 17, EncodedRotationZ)
 				return CurrentOffset + 19
 			end
 
 		elseif ValueType == "Color3" then
-			buffer.writeu8(TargetBuffer, CurrentOffset, DATA_TYPE_COLOR3)
-			buffer.writeu8(TargetBuffer, CurrentOffset + 1, math.round(ValueToWrite.R * 255))
-			buffer.writeu8(TargetBuffer, CurrentOffset + 2, math.round(ValueToWrite.G * 255))
-			buffer.writeu8(TargetBuffer, CurrentOffset + 3, math.round(ValueToWrite.B * 255))
+			BufferWriteU8(TargetBuffer, CurrentOffset, DATA_TYPE_COLOR3)
+			BufferWriteU8(TargetBuffer, CurrentOffset + 1, MathRound(ValueToWrite.R * 255))
+			BufferWriteU8(TargetBuffer, CurrentOffset + 2, MathRound(ValueToWrite.G * 255))
+			BufferWriteU8(TargetBuffer, CurrentOffset + 3, MathRound(ValueToWrite.B * 255))
 			return CurrentOffset + 4
 		elseif ValueType == "buffer" then
-			local BufferLength = buffer.len(ValueToWrite)
+			local BufferLength = BufferLen(ValueToWrite)
 			if BufferLength < 65536 then
-				buffer.writeu8(TargetBuffer, CurrentOffset, DATA_TYPE_BUFFER_16)
-				buffer.writeu16(TargetBuffer, CurrentOffset + 1, BufferLength)
-				buffer.copy(TargetBuffer, CurrentOffset + 3, ValueToWrite, 0, BufferLength)
+				BufferWriteU8(TargetBuffer, CurrentOffset, DATA_TYPE_BUFFER_16)
+				BufferWriteU16(TargetBuffer, CurrentOffset + 1, BufferLength)
+				BufferCopy(TargetBuffer, CurrentOffset + 3, ValueToWrite, 0, BufferLength)
 				return CurrentOffset + 3 + BufferLength
 			else
-				buffer.writeu8(TargetBuffer, CurrentOffset, DATA_TYPE_BUFFER_32)
-				buffer.writeu32(TargetBuffer, CurrentOffset + 1, BufferLength)
-				buffer.copy(TargetBuffer, CurrentOffset + 5, ValueToWrite, 0, BufferLength)
+				BufferWriteU8(TargetBuffer, CurrentOffset, DATA_TYPE_BUFFER_32)
+				BufferWriteU32(TargetBuffer, CurrentOffset + 1, BufferLength)
+				BufferCopy(TargetBuffer, CurrentOffset + 5, ValueToWrite, 0, BufferLength)
 				return CurrentOffset + 5 + BufferLength
 			end
 		end
@@ -1051,54 +1016,54 @@ do
 	StaticTypeHandlers[DATA_TYPE_NIL] = function(SourceBuffer, CurrentOffset, InstanceSource) return nil, CurrentOffset end
 	StaticTypeHandlers[DATA_TYPE_FALSE] = function(SourceBuffer, CurrentOffset, InstanceSource) return false, CurrentOffset end
 	StaticTypeHandlers[DATA_TYPE_TRUE] = function(SourceBuffer, CurrentOffset, InstanceSource) return true, CurrentOffset end
-	StaticTypeHandlers[DATA_TYPE_F64] = function(SourceBuffer, CurrentOffset, InstanceSource) return buffer.readf64(SourceBuffer, CurrentOffset), CurrentOffset + 8 end
-	StaticTypeHandlers[DATA_TYPE_INT8] = function(SourceBuffer, CurrentOffset, InstanceSource) return buffer.readi8(SourceBuffer, CurrentOffset), CurrentOffset + 1 end
-	StaticTypeHandlers[DATA_TYPE_INT16] = function(SourceBuffer, CurrentOffset, InstanceSource) return buffer.readi16(SourceBuffer, CurrentOffset), CurrentOffset + 2 end
-	StaticTypeHandlers[DATA_TYPE_INT32] = function(SourceBuffer, CurrentOffset, InstanceSource) return buffer.readi32(SourceBuffer, CurrentOffset), CurrentOffset + 4 end
-	StaticTypeHandlers[DATA_TYPE_VECTOR3] = function(SourceBuffer, CurrentOffset, InstanceSource) return Vector3.new(buffer.readf32(SourceBuffer,CurrentOffset), buffer.readf32(SourceBuffer,CurrentOffset+4), buffer.readf32(SourceBuffer,CurrentOffset+8)), CurrentOffset + 12 end
+	StaticTypeHandlers[DATA_TYPE_F64] = function(SourceBuffer, CurrentOffset, InstanceSource) return BufferReadF64(SourceBuffer, CurrentOffset), CurrentOffset + 8 end
+	StaticTypeHandlers[DATA_TYPE_INT8] = function(SourceBuffer, CurrentOffset, InstanceSource) return BufferReadI8(SourceBuffer, CurrentOffset), CurrentOffset + 1 end
+	StaticTypeHandlers[DATA_TYPE_INT16] = function(SourceBuffer, CurrentOffset, InstanceSource) return BufferReadI16(SourceBuffer, CurrentOffset), CurrentOffset + 2 end
+	StaticTypeHandlers[DATA_TYPE_INT32] = function(SourceBuffer, CurrentOffset, InstanceSource) return BufferReadI32(SourceBuffer, CurrentOffset), CurrentOffset + 4 end
+	StaticTypeHandlers[DATA_TYPE_VECTOR3] = function(SourceBuffer, CurrentOffset, InstanceSource) return Vector3.new(BufferReadF32(SourceBuffer,CurrentOffset), BufferReadF32(SourceBuffer,CurrentOffset+4), BufferReadF32(SourceBuffer,CurrentOffset+8)), CurrentOffset + 12 end
 	StaticTypeHandlers[DATA_TYPE_VECTOR3_ZERO] = function(SourceBuffer, CurrentOffset, InstanceSource) return Vector3.zero, CurrentOffset end
 	StaticTypeHandlers[DATA_TYPE_VECTOR3_ONE] = function(SourceBuffer, CurrentOffset, InstanceSource) return Vector3.one, CurrentOffset end
-	StaticTypeHandlers[DATA_TYPE_VECTOR3_INT16] = function(SourceBuffer, CurrentOffset, InstanceSource) return Vector3.new(buffer.readi16(SourceBuffer,CurrentOffset), buffer.readi16(SourceBuffer,CurrentOffset+2), buffer.readi16(SourceBuffer,CurrentOffset+4)), CurrentOffset + 6 end
-	StaticTypeHandlers[DATA_TYPE_VECTOR3_INT8] = function(SourceBuffer, CurrentOffset, InstanceSource) return Vector3.new(buffer.readi8(SourceBuffer,CurrentOffset), buffer.readi8(SourceBuffer,CurrentOffset+1), buffer.readi8(SourceBuffer,CurrentOffset+2)), CurrentOffset + 3 end
-	StaticTypeHandlers[DATA_TYPE_COLOR3] = function(SourceBuffer, CurrentOffset, InstanceSource) return Color3.fromRGB(buffer.readu8(SourceBuffer,CurrentOffset), buffer.readu8(SourceBuffer,CurrentOffset+1), buffer.readu8(SourceBuffer,CurrentOffset+2)), CurrentOffset + 3 end
-	StaticTypeHandlers[DATA_TYPE_INSTANCE] = function(SourceBuffer, CurrentOffset, InstanceSource: {Instance}?) local InstanceIndex = buffer.readu16(SourceBuffer, CurrentOffset); return if InstanceSource and InstanceSource[InstanceIndex] then InstanceSource[InstanceIndex] else nil, CurrentOffset + 2 end
-	StaticTypeHandlers[DATA_TYPE_BUFFER_16] = function(SourceBuffer, CurrentOffset, InstanceSource) local BufferLength = buffer.readu16(SourceBuffer, CurrentOffset); local NewBuffer = buffer.create(BufferLength); buffer.copy(NewBuffer, 0, SourceBuffer, CurrentOffset+2, BufferLength); return NewBuffer, CurrentOffset + 2 + BufferLength end
-	StaticTypeHandlers[DATA_TYPE_BUFFER_32] = function(SourceBuffer, CurrentOffset, InstanceSource) local BufferLength = buffer.readu32(SourceBuffer, CurrentOffset); local NewBuffer = buffer.create(BufferLength); buffer.copy(NewBuffer, 0, SourceBuffer, CurrentOffset+4, BufferLength); return NewBuffer, CurrentOffset + 4 + BufferLength end
-	StaticTypeHandlers[DATA_TYPE_STRING_LONG] = function(SourceBuffer, CurrentOffset, InstanceSource) local StringLength = buffer.readu32(SourceBuffer, CurrentOffset); return buffer.readstring(SourceBuffer, CurrentOffset+4, StringLength), CurrentOffset + 4 + StringLength end
+	StaticTypeHandlers[DATA_TYPE_VECTOR3_INT16] = function(SourceBuffer, CurrentOffset, InstanceSource) return Vector3.new(BufferReadI16(SourceBuffer,CurrentOffset), BufferReadI16(SourceBuffer,CurrentOffset+2), BufferReadI16(SourceBuffer,CurrentOffset+4)), CurrentOffset + 6 end
+	StaticTypeHandlers[DATA_TYPE_VECTOR3_INT8] = function(SourceBuffer, CurrentOffset, InstanceSource) return Vector3.new(BufferReadI8(SourceBuffer,CurrentOffset), BufferReadI8(SourceBuffer,CurrentOffset+1), BufferReadI8(SourceBuffer,CurrentOffset+2)), CurrentOffset + 3 end
+	StaticTypeHandlers[DATA_TYPE_COLOR3] = function(SourceBuffer, CurrentOffset, InstanceSource) return Color3.fromRGB(BufferReadU8(SourceBuffer,CurrentOffset), BufferReadU8(SourceBuffer,CurrentOffset+1), BufferReadU8(SourceBuffer,CurrentOffset+2)), CurrentOffset + 3 end
+	StaticTypeHandlers[DATA_TYPE_INSTANCE] = function(SourceBuffer, CurrentOffset, InstanceSource: {Instance}?) local InstanceIndex = BufferReadU16(SourceBuffer, CurrentOffset); return if InstanceSource and InstanceSource[InstanceIndex] then InstanceSource[InstanceIndex] else nil, CurrentOffset + 2 end
+	StaticTypeHandlers[DATA_TYPE_BUFFER_16] = function(SourceBuffer, CurrentOffset, InstanceSource) local BufferLength = BufferReadU16(SourceBuffer, CurrentOffset); local NewBuffer = BufferCreate(BufferLength); BufferCopy(NewBuffer, 0, SourceBuffer, CurrentOffset+2, BufferLength); return NewBuffer, CurrentOffset + 2 + BufferLength end
+	StaticTypeHandlers[DATA_TYPE_BUFFER_32] = function(SourceBuffer, CurrentOffset, InstanceSource) local BufferLength = BufferReadU32(SourceBuffer, CurrentOffset); local NewBuffer = BufferCreate(BufferLength); BufferCopy(NewBuffer, 0, SourceBuffer, CurrentOffset+4, BufferLength); return NewBuffer, CurrentOffset + 4 + BufferLength end
+	StaticTypeHandlers[DATA_TYPE_STRING_LONG] = function(SourceBuffer, CurrentOffset, InstanceSource) local StringLength = BufferReadU32(SourceBuffer, CurrentOffset); return BufferReadString(SourceBuffer, CurrentOffset+4, StringLength), CurrentOffset + 4 + StringLength end
 
 	StaticTypeHandlers[DATA_TYPE_CFRAME] = function(SourceBuffer, CurrentOffset, InstanceSource)
-		local PositionX, PositionY, PositionZ = buffer.readf32(SourceBuffer, CurrentOffset), buffer.readf32(SourceBuffer, CurrentOffset+4), buffer.readf32(SourceBuffer, CurrentOffset+8)
-		local EulerAngleX, EulerAngleY, EulerAngleZ = buffer.readu16(SourceBuffer, CurrentOffset+12) / 10430.2191955, buffer.readu16(SourceBuffer, CurrentOffset+14) / 10430.2191955, buffer.readu16(SourceBuffer, CurrentOffset+16) / 10430.2191955
+		local PositionX, PositionY, PositionZ = BufferReadF32(SourceBuffer, CurrentOffset), BufferReadF32(SourceBuffer, CurrentOffset+4), BufferReadF32(SourceBuffer, CurrentOffset+8)
+		local EulerAngleX, EulerAngleY, EulerAngleZ = BufferReadU16(SourceBuffer, CurrentOffset+12) / 10430.2191955, BufferReadU16(SourceBuffer, CurrentOffset+14) / 10430.2191955, BufferReadU16(SourceBuffer, CurrentOffset+16) / 10430.2191955
 		return CFrame.fromEulerAnglesXYZ(EulerAngleX, EulerAngleY, EulerAngleZ) + Vector3.new(PositionX, PositionY, PositionZ), CurrentOffset + 20
 	end
 
 	StaticTypeHandlers[DATA_TYPE_CF_IDENTITY_ZERO] = function(SourceBuffer, CurrentOffset, InstanceSource) return CFrame.new(), CurrentOffset end
-	StaticTypeHandlers[DATA_TYPE_CF_IDENTITY_INT8] = function(SourceBuffer, CurrentOffset, InstanceSource) return CFrame.new(buffer.readi8(SourceBuffer,CurrentOffset), buffer.readi8(SourceBuffer,CurrentOffset+1), buffer.readi8(SourceBuffer,CurrentOffset+2)), CurrentOffset + 3 end
-	StaticTypeHandlers[DATA_TYPE_CF_IDENTITY_INT16] = function(SourceBuffer, CurrentOffset, InstanceSource) return CFrame.new(buffer.readi16(SourceBuffer,CurrentOffset), buffer.readi16(SourceBuffer,CurrentOffset+2), buffer.readi16(SourceBuffer,CurrentOffset+4)), CurrentOffset + 6 end
-	StaticTypeHandlers[DATA_TYPE_CF_IDENTITY_F32] = function(SourceBuffer, CurrentOffset, InstanceSource) return CFrame.new(buffer.readf32(SourceBuffer,CurrentOffset), buffer.readf32(SourceBuffer,CurrentOffset+4), buffer.readf32(SourceBuffer,CurrentOffset+8)), CurrentOffset + 12 end
+	StaticTypeHandlers[DATA_TYPE_CF_IDENTITY_INT8] = function(SourceBuffer, CurrentOffset, InstanceSource) return CFrame.new(BufferReadI8(SourceBuffer,CurrentOffset), BufferReadI8(SourceBuffer,CurrentOffset+1), BufferReadI8(SourceBuffer,CurrentOffset+2)), CurrentOffset + 3 end
+	StaticTypeHandlers[DATA_TYPE_CF_IDENTITY_INT16] = function(SourceBuffer, CurrentOffset, InstanceSource) return CFrame.new(BufferReadI16(SourceBuffer,CurrentOffset), BufferReadI16(SourceBuffer,CurrentOffset+2), BufferReadI16(SourceBuffer,CurrentOffset+4)), CurrentOffset + 6 end
+	StaticTypeHandlers[DATA_TYPE_CF_IDENTITY_F32] = function(SourceBuffer, CurrentOffset, InstanceSource) return CFrame.new(BufferReadF32(SourceBuffer,CurrentOffset), BufferReadF32(SourceBuffer,CurrentOffset+4), BufferReadF32(SourceBuffer,CurrentOffset+8)), CurrentOffset + 12 end
 
 	StaticTypeHandlers[DATA_TYPE_CF_ROTATION_INT8] = function(SourceBuffer, CurrentOffset, InstanceSource) 
-		local PositionX, PositionY, PositionZ = buffer.readi8(SourceBuffer, CurrentOffset), buffer.readi8(SourceBuffer, CurrentOffset+1), buffer.readi8(SourceBuffer, CurrentOffset+2)
-		local EulerAngleX, EulerAngleY, EulerAngleZ = buffer.readu16(SourceBuffer, CurrentOffset+3) / 10430.2191955, buffer.readu16(SourceBuffer, CurrentOffset+5) / 10430.2191955, buffer.readu16(SourceBuffer, CurrentOffset+7) / 10430.2191955
+		local PositionX, PositionY, PositionZ = BufferReadI8(SourceBuffer, CurrentOffset), BufferReadI8(SourceBuffer, CurrentOffset+1), BufferReadI8(SourceBuffer, CurrentOffset+2)
+		local EulerAngleX, EulerAngleY, EulerAngleZ = BufferReadU16(SourceBuffer, CurrentOffset+3) / 10430.2191955, BufferReadU16(SourceBuffer, CurrentOffset+5) / 10430.2191955, BufferReadU16(SourceBuffer, CurrentOffset+7) / 10430.2191955
 		return CFrame.fromEulerAnglesXYZ(EulerAngleX, EulerAngleY, EulerAngleZ) + Vector3.new(PositionX, PositionY, PositionZ), CurrentOffset + 9
 	end
 
 	StaticTypeHandlers[DATA_TYPE_CF_ROTATION_F32] = function(SourceBuffer, CurrentOffset, InstanceSource)
-		local PositionX, PositionY, PositionZ = buffer.readf32(SourceBuffer, CurrentOffset), buffer.readf32(SourceBuffer, CurrentOffset+4), buffer.readf32(SourceBuffer, CurrentOffset+8)
-		local EulerAngleX, EulerAngleY, EulerAngleZ = buffer.readu16(SourceBuffer, CurrentOffset+12) / 10430.2191955, buffer.readu16(SourceBuffer, CurrentOffset+14) / 10430.2191955, buffer.readu16(SourceBuffer, CurrentOffset+16) / 10430.2191955
+		local PositionX, PositionY, PositionZ = BufferReadF32(SourceBuffer, CurrentOffset), BufferReadF32(SourceBuffer, CurrentOffset+4), BufferReadF32(SourceBuffer, CurrentOffset+8)
+		local EulerAngleX, EulerAngleY, EulerAngleZ = BufferReadU16(SourceBuffer, CurrentOffset+12) / 10430.2191955, BufferReadU16(SourceBuffer, CurrentOffset+14) / 10430.2191955, BufferReadU16(SourceBuffer, CurrentOffset+16) / 10430.2191955
 		return CFrame.fromEulerAnglesXYZ(EulerAngleX, EulerAngleY, EulerAngleZ) + Vector3.new(PositionX, PositionY, PositionZ), CurrentOffset + 18
 	end
 
-	StaticTypeHandlers[DATA_TYPE_ARRAY_LONG] = function(SourceBuffer, CurrentOffset, InstanceSource: {Instance}?) return ReadArray(SourceBuffer, CurrentOffset + 2, InstanceSource, buffer.readu16(SourceBuffer, CurrentOffset)) end
-	StaticTypeHandlers[DATA_TYPE_MAP_LONG] = function(SourceBuffer, CurrentOffset, InstanceSource: {Instance}?) return ReadMap(SourceBuffer, CurrentOffset + 2, InstanceSource, buffer.readu16(SourceBuffer, CurrentOffset)) end
+	StaticTypeHandlers[DATA_TYPE_ARRAY_LONG] = function(SourceBuffer, CurrentOffset, InstanceSource: {Instance}?) return ReadArray(SourceBuffer, CurrentOffset + 2, InstanceSource, BufferReadU16(SourceBuffer, CurrentOffset)) end
+	StaticTypeHandlers[DATA_TYPE_MAP_LONG] = function(SourceBuffer, CurrentOffset, InstanceSource: {Instance}?) return ReadMap(SourceBuffer, CurrentOffset + 2, InstanceSource, BufferReadU16(SourceBuffer, CurrentOffset)) end
 
 	ReadAny = function(SourceBuffer: buffer, CurrentOffset: number, InstanceSource: {Instance}?) : (any, number)
-		local DataTypeId = buffer.readu8(SourceBuffer, CurrentOffset)
+		local DataTypeId = BufferReadU8(SourceBuffer, CurrentOffset)
 		CurrentOffset += 1
 
 		if DataTypeId >= 128 then
 			local StringLength = DataTypeId - 128
-			return buffer.readstring(SourceBuffer, CurrentOffset, StringLength), CurrentOffset + StringLength
+			return BufferReadString(SourceBuffer, CurrentOffset, StringLength), CurrentOffset + StringLength
 		elseif DataTypeId >= 64 then
 			local ElementCount = DataTypeId - 64
 			return ReadMap(SourceBuffer, CurrentOffset, InstanceSource, ElementCount)
@@ -1118,12 +1083,12 @@ do
 	} :: TypeSerializer<any>
 end
 
-local IonLibrary = {}
-IonLibrary.Types = DataTypes
-
 type RateLimitInfo = { LastCheck : number, Count : number }
 
-local PacketDefinitionRegistry : { [number] : {TypeSerializer} } = {}
+local RegistryWriters : { [number] : {(TargetBuffer : buffer, CurrentOffset : number, ValueToWrite : any, InstanceAccumulator : {Instance}?, InstanceLookup : {[Instance]: number}?) -> number} } = {}
+local RegistryReaders : { [number] : {(SourceBuffer : buffer, CurrentOffset : number, InstanceSource : {Instance}?) -> (any, number)} } = {}
+local RegistrySizers : { [number] : {(ValueToCheck : any) -> number} } = {}
+
 local ListenerCallbackRegistry : { [number] : (...any) -> () } = {}
 local RateLimitRegistry : { [number] : number } = {}
 local RateLimitTrackerRegistry : { [number] : { [Player] : RateLimitInfo } } = {}
@@ -1135,10 +1100,33 @@ if IsServerEnvironment then
 	end)
 end
 
+local IonLibrary = {}
+IonLibrary.Types = DataTypes
+
 function IonLibrary.Define(SchemaDefinitions : {TypeSerializer}, Options : PacketOptions?) : any
 	PacketIdentifierCounter += 1
 	local UniquePacketIdentifier = PacketIdentifierCounter
-	PacketDefinitionRegistry[UniquePacketIdentifier] = SchemaDefinitions
+
+	local PacketWriters = {}
+	local PacketReaders = {}
+	local PacketSizers = {}
+
+	local IsSchemaDynamic = false
+	local RequiresInstanceAccumulator = false
+	local BasePacketSize = 0
+
+	for Index, TypeDefinition in ipairs(SchemaDefinitions) do
+		PacketWriters[Index] = TypeDefinition.Write
+		PacketReaders[Index] = TypeDefinition.Read
+		PacketSizers[Index] = TypeDefinition.GetByteSize
+
+		if TypeDefinition.ContainsInstances then RequiresInstanceAccumulator = true end
+		if TypeDefinition.IsDynamic then IsSchemaDynamic = true else BasePacketSize += TypeDefinition.GetByteSize(nil :: any) end
+	end
+
+	RegistryWriters[UniquePacketIdentifier] = PacketWriters
+	RegistryReaders[UniquePacketIdentifier] = PacketReaders
+	RegistrySizers[UniquePacketIdentifier] = PacketSizers
 
 	local IsUnreliable = if Options and Options.Unreliable then true else false
 	local RateLimit = if Options then Options.RateLimit else nil
@@ -1156,39 +1144,37 @@ function IonLibrary.Define(SchemaDefinitions : {TypeSerializer}, Options : Packe
 		ActiveRemoteChannel = if IsUnreliable then MainUnreliableRemote else MainReliableRemote
 	end
 
-	local BasePacketSize = if IsDedicated then 0 else 1
-	local IsSchemaDynamic = false
-	local RequiresInstanceAccumulator = false
-
-	for _, TypeDefinition in ipairs(SchemaDefinitions) do
-		if TypeDefinition.ContainsInstances then RequiresInstanceAccumulator = true end
-		if TypeDefinition.IsDynamic then IsSchemaDynamic = true else BasePacketSize += TypeDefinition.GetByteSize(nil :: any) end
-	end
+	local HeaderSize = if IsDedicated then 0 else 1
+	BasePacketSize += HeaderSize
 
 	local function SerializeArguments(ArgumentList : {any}) : (buffer, {Instance}?)
-		local InstanceAccumulator = if RequiresInstanceAccumulator then {} else nil
-		local InstanceLookup = if RequiresInstanceAccumulator then SharedInstanceLookupTable else nil
+		local InstanceAccumulator
+		local InstanceLookup
 
-		if InstanceLookup then table.clear(InstanceLookup) end
+		if RequiresInstanceAccumulator then
+			table.clear(SharedInstanceAccumulator)
+			table.clear(SharedInstanceLookupTable)
+			InstanceAccumulator = SharedInstanceAccumulator
+			InstanceLookup = SharedInstanceLookupTable
+		end
 
 		local AllocationSize = BasePacketSize
 		if IsSchemaDynamic then
-			AllocationSize = if IsDedicated then 0 else 1
-			for Index, TypeDefinition in ipairs(SchemaDefinitions) do
-				AllocationSize += TypeDefinition.GetByteSize(ArgumentList[Index])
+			for Index = 1, #ArgumentList do
+				AllocationSize += PacketSizers[Index](ArgumentList[Index])
 			end
 		end
 
-		local PayloadBuffer = buffer.create(AllocationSize)
+		local PayloadBuffer = BufferCreate(AllocationSize)
 		local WriteOffset = 0
 
 		if not IsDedicated then
-			buffer.writeu8(PayloadBuffer, 0, UniquePacketIdentifier)
+			BufferWriteU8(PayloadBuffer, 0, UniquePacketIdentifier)
 			WriteOffset = 1
 		end
 
-		for Index, TypeDefinition in ipairs(SchemaDefinitions) do
-			WriteOffset = TypeDefinition.Write(PayloadBuffer, WriteOffset, ArgumentList[Index], InstanceAccumulator, InstanceLookup)
+		for Index = 1, #ArgumentList do
+			WriteOffset = PacketWriters[Index](PayloadBuffer, WriteOffset, ArgumentList[Index], InstanceAccumulator, InstanceLookup)
 		end
 
 		return PayloadBuffer, InstanceAccumulator
@@ -1214,18 +1200,32 @@ function IonLibrary.Define(SchemaDefinitions : {TypeSerializer}, Options : Packe
 				end
 
 				local ReadOffset = 0
-				local ArgumentCount = #SchemaDefinitions
+				local ArgumentCount = #PacketReaders
 
-				if ArgumentCount <= 8 then
+				if ArgumentCount == 1 then
+					local Val1; Val1, ReadOffset = PacketReaders[1](PayloadBuffer, ReadOffset, InstanceSource)
+					if IsServerEnvironment then CallbackFunction(SenderPlayer, Val1) else CallbackFunction(Val1) end
+				elseif ArgumentCount == 2 then
+					local Val1, Val2; 
+					Val1, ReadOffset = PacketReaders[1](PayloadBuffer, ReadOffset, InstanceSource)
+					Val2, ReadOffset = PacketReaders[2](PayloadBuffer, ReadOffset, InstanceSource)
+					if IsServerEnvironment then CallbackFunction(SenderPlayer, Val1, Val2) else CallbackFunction(Val1, Val2) end
+				elseif ArgumentCount == 3 then
+					local Val1, Val2, Val3;
+					Val1, ReadOffset = PacketReaders[1](PayloadBuffer, ReadOffset, InstanceSource)
+					Val2, ReadOffset = PacketReaders[2](PayloadBuffer, ReadOffset, InstanceSource)
+					Val3, ReadOffset = PacketReaders[3](PayloadBuffer, ReadOffset, InstanceSource)
+					if IsServerEnvironment then CallbackFunction(SenderPlayer, Val1, Val2, Val3) else CallbackFunction(Val1, Val2, Val3) end
+				elseif ArgumentCount <= 8 then
 					local Argument1, Argument2, Argument3, Argument4, Argument5, Argument6, Argument7, Argument8
-					if ArgumentCount >= 1 then Argument1, ReadOffset = (SchemaDefinitions[1] :: TypeSerializer).Read(PayloadBuffer, ReadOffset, InstanceSource) end
-					if ArgumentCount >= 2 then Argument2, ReadOffset = (SchemaDefinitions[2] :: TypeSerializer).Read(PayloadBuffer, ReadOffset, InstanceSource) end
-					if ArgumentCount >= 3 then Argument3, ReadOffset = (SchemaDefinitions[3] :: TypeSerializer).Read(PayloadBuffer, ReadOffset, InstanceSource) end
-					if ArgumentCount >= 4 then Argument4, ReadOffset = (SchemaDefinitions[4] :: TypeSerializer).Read(PayloadBuffer, ReadOffset, InstanceSource) end
-					if ArgumentCount >= 5 then Argument5, ReadOffset = (SchemaDefinitions[5] :: TypeSerializer).Read(PayloadBuffer, ReadOffset, InstanceSource) end
-					if ArgumentCount >= 6 then Argument6, ReadOffset = (SchemaDefinitions[6] :: TypeSerializer).Read(PayloadBuffer, ReadOffset, InstanceSource) end
-					if ArgumentCount >= 7 then Argument7, ReadOffset = (SchemaDefinitions[7] :: TypeSerializer).Read(PayloadBuffer, ReadOffset, InstanceSource) end
-					if ArgumentCount >= 8 then Argument8, ReadOffset = (SchemaDefinitions[8] :: TypeSerializer).Read(PayloadBuffer, ReadOffset, InstanceSource) end
+					if ArgumentCount >= 1 then Argument1, ReadOffset = PacketReaders[1](PayloadBuffer, ReadOffset, InstanceSource) end
+					if ArgumentCount >= 2 then Argument2, ReadOffset = PacketReaders[2](PayloadBuffer, ReadOffset, InstanceSource) end
+					if ArgumentCount >= 3 then Argument3, ReadOffset = PacketReaders[3](PayloadBuffer, ReadOffset, InstanceSource) end
+					if ArgumentCount >= 4 then Argument4, ReadOffset = PacketReaders[4](PayloadBuffer, ReadOffset, InstanceSource) end
+					if ArgumentCount >= 5 then Argument5, ReadOffset = PacketReaders[5](PayloadBuffer, ReadOffset, InstanceSource) end
+					if ArgumentCount >= 6 then Argument6, ReadOffset = PacketReaders[6](PayloadBuffer, ReadOffset, InstanceSource) end
+					if ArgumentCount >= 7 then Argument7, ReadOffset = PacketReaders[7](PayloadBuffer, ReadOffset, InstanceSource) end
+					if ArgumentCount >= 8 then Argument8, ReadOffset = PacketReaders[8](PayloadBuffer, ReadOffset, InstanceSource) end
 
 					if IsServerEnvironment then
 						CallbackFunction(SenderPlayer, Argument1, Argument2, Argument3, Argument4, Argument5, Argument6, Argument7, Argument8)
@@ -1234,7 +1234,7 @@ function IonLibrary.Define(SchemaDefinitions : {TypeSerializer}, Options : Packe
 					end
 				else
 					local ArgumentsTable = table.create(ArgumentCount)
-					for Index = 1, ArgumentCount do ArgumentsTable[Index], ReadOffset = (SchemaDefinitions[Index] :: TypeSerializer).Read(PayloadBuffer, ReadOffset, InstanceSource) end
+					for Index = 1, ArgumentCount do ArgumentsTable[Index], ReadOffset = PacketReaders[Index](PayloadBuffer, ReadOffset, InstanceSource) end
 
 					if IsServerEnvironment then
 						CallbackFunction(SenderPlayer, table.unpack(ArgumentsTable))
@@ -1314,11 +1314,12 @@ function IonLibrary.Define(SchemaDefinitions : {TypeSerializer}, Options : Packe
 end
 
 local function HandleNetworkEvent(SenderPlayer : Player?, PayloadBuffer : buffer, InstanceSource : {Instance}?)
-	if buffer.len(PayloadBuffer) < 1 then return end
-	local PacketIdentifier = buffer.readu8(PayloadBuffer, 0)
-	local SchemaDefinitions = PacketDefinitionRegistry[PacketIdentifier]
+	if BufferLen(PayloadBuffer) < 1 then return end
+	local PacketIdentifier = BufferReadU8(PayloadBuffer, 0)
+
+	local PacketReaders = RegistryReaders[PacketIdentifier]
 	local CallbackFunction = ListenerCallbackRegistry[PacketIdentifier]
-	if not SchemaDefinitions or not CallbackFunction then return end
+	if not PacketReaders or not CallbackFunction then return end
 
 	if IsServerEnvironment and SenderPlayer then
 		local Limit = RateLimitRegistry[PacketIdentifier]
@@ -1334,18 +1335,32 @@ local function HandleNetworkEvent(SenderPlayer : Player?, PayloadBuffer : buffer
 	end
 
 	local ReadOffset = 1
-	local ArgumentCount = #SchemaDefinitions
+	local ArgumentCount = #PacketReaders
 
-	if ArgumentCount <= 8 then
+	if ArgumentCount == 1 then
+		local Val1; Val1, ReadOffset = PacketReaders[1](PayloadBuffer, ReadOffset, InstanceSource)
+		if IsServerEnvironment then CallbackFunction(SenderPlayer, Val1) else CallbackFunction(Val1) end
+	elseif ArgumentCount == 2 then
+		local Val1, Val2; 
+		Val1, ReadOffset = PacketReaders[1](PayloadBuffer, ReadOffset, InstanceSource)
+		Val2, ReadOffset = PacketReaders[2](PayloadBuffer, ReadOffset, InstanceSource)
+		if IsServerEnvironment then CallbackFunction(SenderPlayer, Val1, Val2) else CallbackFunction(Val1, Val2) end
+	elseif ArgumentCount == 3 then
+		local Val1, Val2, Val3;
+		Val1, ReadOffset = PacketReaders[1](PayloadBuffer, ReadOffset, InstanceSource)
+		Val2, ReadOffset = PacketReaders[2](PayloadBuffer, ReadOffset, InstanceSource)
+		Val3, ReadOffset = PacketReaders[3](PayloadBuffer, ReadOffset, InstanceSource)
+		if IsServerEnvironment then CallbackFunction(SenderPlayer, Val1, Val2, Val3) else CallbackFunction(Val1, Val2, Val3) end
+	elseif ArgumentCount <= 8 then
 		local Argument1, Argument2, Argument3, Argument4, Argument5, Argument6, Argument7, Argument8
-		if ArgumentCount >= 1 then Argument1, ReadOffset = (SchemaDefinitions[1] :: TypeSerializer).Read(PayloadBuffer, ReadOffset, InstanceSource) end
-		if ArgumentCount >= 2 then Argument2, ReadOffset = (SchemaDefinitions[2] :: TypeSerializer).Read(PayloadBuffer, ReadOffset, InstanceSource) end
-		if ArgumentCount >= 3 then Argument3, ReadOffset = (SchemaDefinitions[3] :: TypeSerializer).Read(PayloadBuffer, ReadOffset, InstanceSource) end
-		if ArgumentCount >= 4 then Argument4, ReadOffset = (SchemaDefinitions[4] :: TypeSerializer).Read(PayloadBuffer, ReadOffset, InstanceSource) end
-		if ArgumentCount >= 5 then Argument5, ReadOffset = (SchemaDefinitions[5] :: TypeSerializer).Read(PayloadBuffer, ReadOffset, InstanceSource) end
-		if ArgumentCount >= 6 then Argument6, ReadOffset = (SchemaDefinitions[6] :: TypeSerializer).Read(PayloadBuffer, ReadOffset, InstanceSource) end
-		if ArgumentCount >= 7 then Argument7, ReadOffset = (SchemaDefinitions[7] :: TypeSerializer).Read(PayloadBuffer, ReadOffset, InstanceSource) end
-		if ArgumentCount >= 8 then Argument8, ReadOffset = (SchemaDefinitions[8] :: TypeSerializer).Read(PayloadBuffer, ReadOffset, InstanceSource) end
+		if ArgumentCount >= 1 then Argument1, ReadOffset = PacketReaders[1](PayloadBuffer, ReadOffset, InstanceSource) end
+		if ArgumentCount >= 2 then Argument2, ReadOffset = PacketReaders[2](PayloadBuffer, ReadOffset, InstanceSource) end
+		if ArgumentCount >= 3 then Argument3, ReadOffset = PacketReaders[3](PayloadBuffer, ReadOffset, InstanceSource) end
+		if ArgumentCount >= 4 then Argument4, ReadOffset = PacketReaders[4](PayloadBuffer, ReadOffset, InstanceSource) end
+		if ArgumentCount >= 5 then Argument5, ReadOffset = PacketReaders[5](PayloadBuffer, ReadOffset, InstanceSource) end
+		if ArgumentCount >= 6 then Argument6, ReadOffset = PacketReaders[6](PayloadBuffer, ReadOffset, InstanceSource) end
+		if ArgumentCount >= 7 then Argument7, ReadOffset = PacketReaders[7](PayloadBuffer, ReadOffset, InstanceSource) end
+		if ArgumentCount >= 8 then Argument8, ReadOffset = PacketReaders[8](PayloadBuffer, ReadOffset, InstanceSource) end
 
 		if IsServerEnvironment then
 			CallbackFunction(SenderPlayer, Argument1, Argument2, Argument3, Argument4, Argument5, Argument6, Argument7, Argument8)
@@ -1356,7 +1371,7 @@ local function HandleNetworkEvent(SenderPlayer : Player?, PayloadBuffer : buffer
 		local ArgumentsTable = table.create(ArgumentCount)
 		for Index = 1, ArgumentCount do
 			local DecodedValue
-			DecodedValue, ReadOffset = (SchemaDefinitions[Index] :: TypeSerializer).Read(PayloadBuffer, ReadOffset, InstanceSource)
+			DecodedValue, ReadOffset = PacketReaders[Index](PayloadBuffer, ReadOffset, InstanceSource)
 			ArgumentsTable[Index] = DecodedValue
 		end
 
