@@ -1148,6 +1148,7 @@ function IonLibrary.Define(SchemaDefinitions : {TypeSerializer}, Options : Packe
 	BasePacketSize += HeaderSize
 
 	local StaticBufferSize = if not IsSchemaDynamic then BasePacketSize else 0
+	local SchemaCount = #SchemaDefinitions
 
 	local function SerializeArguments(ArgumentList : {any}) : (buffer, {Instance}?)
 		local InstanceAccumulator
@@ -1163,7 +1164,7 @@ function IonLibrary.Define(SchemaDefinitions : {TypeSerializer}, Options : Packe
 		local AllocationSize = StaticBufferSize
 		if IsSchemaDynamic then
 			AllocationSize = BasePacketSize
-			for Index = 1, #ArgumentList do
+			for Index = 1, SchemaCount do
 				AllocationSize += PacketSizers[Index](ArgumentList[Index])
 			end
 		end
@@ -1176,7 +1177,7 @@ function IonLibrary.Define(SchemaDefinitions : {TypeSerializer}, Options : Packe
 			WriteOffset = 1
 		end
 
-		for Index = 1, #ArgumentList do
+		for Index = 1, SchemaCount do
 			WriteOffset = PacketWriters[Index](PayloadBuffer, WriteOffset, ArgumentList[Index], InstanceAccumulator, InstanceLookup)
 		end
 
