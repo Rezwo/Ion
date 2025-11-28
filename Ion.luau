@@ -999,19 +999,19 @@ do
 		error("Ion: Unserializable type in Any: " .. ValueType)
 	end
 
-	local function ReadArray(SourceBuffer: buffer, CurrentOffset: number, InstanceSource: {Instance}?, ElementCount: number) : ({any}, number)
+	local function ReadArray(SourceBuffer : buffer, CurrentOffset : number, InstanceSource : {Instance}?, ElementCount : number) : ({any}, number)
 		local ResultTable = table.create(ElementCount)
 		for Index = 1, ElementCount do local DecodedValue; DecodedValue, CurrentOffset = ReadAny(SourceBuffer, CurrentOffset, InstanceSource); ResultTable[Index] = DecodedValue end
 		return ResultTable, CurrentOffset
 	end
 
-	local function ReadMap(SourceBuffer: buffer, CurrentOffset: number, InstanceSource: {Instance}?, ElementCount: number) : ({[any]: any}, number)
+	local function ReadMap(SourceBuffer : buffer, CurrentOffset : number, InstanceSource : {Instance}?, ElementCount : number) : ({[any] : any}, number)
 		local ResultTable = {}
 		for _ = 1, ElementCount do local DecodedKey, DecodedValue; DecodedKey, CurrentOffset = ReadAny(SourceBuffer, CurrentOffset, InstanceSource); DecodedValue, CurrentOffset = ReadAny(SourceBuffer, CurrentOffset, InstanceSource); ResultTable[DecodedKey] = DecodedValue end
 		return ResultTable, CurrentOffset
 	end
 
-	local StaticTypeHandlers: { [number]: (buffer, number, {Instance}?) -> (any, number) } = {}
+	local StaticTypeHandlers: { [number] : (buffer, number, {Instance}?) -> (any, number) } = {}
 
 	StaticTypeHandlers[DATA_TYPE_NIL] = function(SourceBuffer, CurrentOffset, InstanceSource) return nil, CurrentOffset end
 	StaticTypeHandlers[DATA_TYPE_FALSE] = function(SourceBuffer, CurrentOffset, InstanceSource) return false, CurrentOffset end
