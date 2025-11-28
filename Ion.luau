@@ -1147,7 +1147,6 @@ function IonLibrary.Define(SchemaDefinitions : {TypeSerializer}, Options : Packe
 	local HeaderSize = if IsDedicated then 0 else 1
 	BasePacketSize += HeaderSize
 
-	-- Optimization 2: Pre-calculate static buffer size upvalue
 	local StaticBufferSize = if not IsSchemaDynamic then BasePacketSize else 0
 
 	local function SerializeArguments(ArgumentList : {any}) : (buffer, {Instance}?)
