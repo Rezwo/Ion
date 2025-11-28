@@ -662,7 +662,8 @@ function DataTypes.Struct(StructureDefinition: {[string]: TypeSerializer}) : Typ
 		GetByteSize = function(ValueToWrite)
 			local TotalSize = 0
 			for Index, DefinitionKey in ipairs(SortedKeys) do
-				TotalSize += FieldSizers[Index](ValueToWrite[DefinitionKey])
+				local FieldValue = if ValueToWrite then ValueToWrite[DefinitionKey] else nil
+				TotalSize += FieldSizers[Index](FieldValue)
 			end
 			return TotalSize
 		end,
