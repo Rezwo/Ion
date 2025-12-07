@@ -41,7 +41,7 @@ local MathRound = math.round
 
 local IonVersion : number = 1
 local MaxPacketSize : number = 900
-local BufferPool : { buffer } = table.create(64)
+local BufferPool : { buffer } = {}
 local PoolCapacity : number = 64
 local PoolBufferSize : number = 4096
 
@@ -805,12 +805,12 @@ local function CheckGlobalRateLimit(Player : Player) : boolean
 		Limiter = { Tokens = GlobalLimitSettings, LastUpdate = os.clock(), RefillRate = GlobalLimitSettings, Capacity = GlobalLimitSettings * 1.5 }
 		GlobalRateLimitPerPlayer[Player] = Limiter
 	end
-	
+
 	local Now : number = os.clock()
 	local Delta : number = Now - Limiter.LastUpdate
 	Limiter.LastUpdate = Now
 	Limiter.Tokens = math.min(Limiter.Capacity, Limiter.Tokens + (Delta * Limiter.RefillRate))
-	
+
 	if Limiter.Tokens >= 1 then
 		Limiter.Tokens -= 1
 		return true
@@ -835,27 +835,27 @@ end
 function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Options : { Unreliable : boolean?, RateLimit : number?, Compress : boolean?, Middleware : Middleware? }?)
 	local Hash : number = 0
 	for Index = 1, #Namespace do Hash = (Hash * 31 + string.byte(Namespace, Index)) % 256 end
-	
+
 	if Definitions[Hash] then error("Ion: Namespace collision for '" .. Namespace .. "'") end
 	Definitions[Hash] = Schema
-	
+
 	local IsUnreliable : boolean = Options and Options.Unreliable or false
 	local Rate : number? = Options and Options.RateLimit
 	local UseCompression : boolean = Options and Options.Compress or false
 	local Hooks : Middleware? = Options and Options.Middleware
-	
+
 	local RemoteName : string = "Ion_" .. Hash
-	
+
 	if RunService:IsServer() then
 		local Remote : Instance
 		if IsUnreliable then Remote = Instance.new("UnreliableRemoteEvent") else Remote = Instance.new("RemoteEvent") end
 		Remote.Name = RemoteName
 		Remote.Parent = ReplicatedStorage
 		RemoteCache[Hash] = Remote :: any
-		
+
 		local function OnServerEvent(Player : Player, Data : buffer, Instances : { Instance })
 			if not CheckGlobalRateLimit(Player) then return end
-			
+
 			if Rate then
 				local Limiter : RateLimit = GetRateLimiter(Hash, Player, Rate)
 				local Now : number = os.clock()
@@ -864,49 +864,11 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 				Limiter.Tokens = math.min(Limiter.Capacity, Limiter.Tokens + (Delta * Limiter.RefillRate))
 				if Limiter.Tokens >= 1 then Limiter.Tokens -= 1 else return end
 			end
-			
+
 			local Length : number = BufferLen(Data)
 			GlobalStats.TotalBytesReceived += Length
 			GlobalStats.PacketsReceived += 1
-			
-			if UseCompression then
-				local Base64Data : buffer = Data
-				local Compressed : buffer = EncodingService:Base64Decode(Base64Data)
-				Data = EncodingService:DecompressBuffer(Compressed, Enum.CompressionAlgorithm.Zstd)
-			end
-			
-			local Callback = Listeners[Hash]
-			if Callback then
-				local Args : { any } = {}
-				local CursorPosition : number = 0
-				CheckBounds(Data, CursorPosition, 2)
-				local Version : number = BufferReadU8(Data, CursorPosition)
-				local PacketId : number = BufferReadU8(Data, CursorPosition + 1)
-				CursorPosition += 2
-				
-				if Version ~= IonVersion or PacketId ~= Hash then return end
-				for Index, Serializer : TypeSerializer<any> in ipairs(Schema) do
-					local Value : any
-					Value, CursorPosition = Serializer.Read(Data, CursorPosition, Instances)
-					table.insert(Args, Value)
-				end
-				
-				if Hooks and Hooks.OnAfterReceived then Hooks.OnAfterReceived(Player, table.unpack(Args)) end
-				Callback(Player, table.unpack(Args))
-			end
-		end
-		
-		if IsUnreliable then (Remote :: UnreliableRemoteEvent).OnServerEvent:Connect(OnServerEvent)
-		else (Remote :: RemoteEvent).OnServerEvent:Connect(OnServerEvent) end
-	else
-		local Remote : Instance = ReplicatedStorage:WaitForChild(RemoteName)
-		RemoteCache[Hash] = Remote :: any
-		
-		local function OnClientEvent(Data : buffer, Instances : { Instance })
-			local Length : number = BufferLen(Data)
-			GlobalStats.TotalBytesReceived += Length
-			GlobalStats.PacketsReceived += 1
-			
+
 			if UseCompression then
 				local Base64Data : buffer = Data
 				local Compressed : buffer = EncodingService:Base64Decode(Base64Data)
@@ -921,60 +883,98 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 				local Version : number = BufferReadU8(Data, CursorPosition)
 				local PacketId : number = BufferReadU8(Data, CursorPosition + 1)
 				CursorPosition += 2
-				
+
 				if Version ~= IonVersion or PacketId ~= Hash then return end
 				for Index, Serializer : TypeSerializer<any> in ipairs(Schema) do
 					local Value : any
 					Value, CursorPosition = Serializer.Read(Data, CursorPosition, Instances)
 					table.insert(Args, Value)
 				end
-				
+
+				if Hooks and Hooks.OnAfterReceived then Hooks.OnAfterReceived(Player, table.unpack(Args)) end
+				Callback(Player, table.unpack(Args))
+			end
+		end
+
+		if IsUnreliable then (Remote :: UnreliableRemoteEvent).OnServerEvent:Connect(OnServerEvent)
+		else (Remote :: RemoteEvent).OnServerEvent:Connect(OnServerEvent) end
+	else
+		local Remote : Instance = ReplicatedStorage:WaitForChild(RemoteName)
+		RemoteCache[Hash] = Remote :: any
+
+		local function OnClientEvent(Data : buffer, Instances : { Instance })
+			local Length : number = BufferLen(Data)
+			GlobalStats.TotalBytesReceived += Length
+			GlobalStats.PacketsReceived += 1
+
+			if UseCompression then
+				local Base64Data : buffer = Data
+				local Compressed : buffer = EncodingService:Base64Decode(Base64Data)
+				Data = EncodingService:DecompressBuffer(Compressed, Enum.CompressionAlgorithm.Zstd)
+			end
+
+			local Callback = Listeners[Hash]
+			if Callback then
+				local Args : { any } = {}
+				local CursorPosition : number = 0
+				CheckBounds(Data, CursorPosition, 2)
+				local Version : number = BufferReadU8(Data, CursorPosition)
+				local PacketId : number = BufferReadU8(Data, CursorPosition + 1)
+				CursorPosition += 2
+
+				if Version ~= IonVersion or PacketId ~= Hash then return end
+				for Index, Serializer : TypeSerializer<any> in ipairs(Schema) do
+					local Value : any
+					Value, CursorPosition = Serializer.Read(Data, CursorPosition, Instances)
+					table.insert(Args, Value)
+				end
+
 				if Hooks and Hooks.OnAfterReceived then Hooks.OnAfterReceived(table.unpack(Args)) end
 				Callback(table.unpack(Args))
 			end
 		end
-		
+
 		if IsUnreliable then (Remote :: UnreliableRemoteEvent).OnClientEvent:Connect(OnClientEvent)
 		else (Remote :: RemoteEvent).OnClientEvent:Connect(OnClientEvent) end
 	end
-	
+
 	local PacketObject = {}
-	
+
 	function PacketObject.Send(Target : Player?, ... : any)
 		if Hooks and Hooks.OnBeforeSend then
 			if not Hooks.OnBeforeSend(...) then return end
 		end
-		
+
 		local Args : { any } = { ... }
 		local TargetBuffer : buffer = AcquireBuffer(1024)
 		local CursorPosition : number = 0
 		local InstanceAccumulator : { Instance } = {}
 		local InstanceLookup : { [Instance] : number } = {}
-		
+
 		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 2)
 		BufferWriteU8(TargetBuffer, CursorPosition, IonVersion)
 		BufferWriteU8(TargetBuffer, CursorPosition + 1, Hash)
 		CursorPosition += 2
-		
+
 		for Index, Serializer : TypeSerializer<any> in ipairs(Schema) do
 			CursorPosition = Serializer.Write(TargetBuffer, CursorPosition, Args[Index], InstanceAccumulator, InstanceLookup)
 		end
-		
+
 		local FinalBuffer : buffer = BufferCreate(CursorPosition)
 		BufferCopy(FinalBuffer, 0, TargetBuffer, 0, CursorPosition)
 		ReleaseBuffer(TargetBuffer)
-		
+
 		if UseCompression then
 			local Compressed : buffer = EncodingService:CompressBuffer(FinalBuffer, Enum.CompressionAlgorithm.Zstd)
 			FinalBuffer = EncodingService:Base64Encode(Compressed)
 		end
-		
+
 		local Size : number = BufferLen(FinalBuffer)
 		if IsUnreliable and Size > MaxPacketSize then warn("Ion: Unreliable packet too large"); return end
-		
+
 		GlobalStats.TotalBytesSent += Size
 		GlobalStats.PacketsSent += 1
-		
+
 		local Remote : any = RemoteCache[Hash]
 		if RunService:IsServer() then
 			if Target then Remote:FireClient(Target, FinalBuffer, InstanceAccumulator)
@@ -983,11 +983,11 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 			Remote:FireServer(FinalBuffer, InstanceAccumulator)
 		end
 	end
-	
+
 	function PacketObject.Listen(Callback : (...any) -> ())
 		Listeners[Hash] = Callback
 	end
-	
+
 	function PacketObject.Destroy()
 		Listeners[Hash] = nil
 		local Remote : any = RemoteCache[Hash]
@@ -997,18 +997,18 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 		end
 		Definitions[Hash] = nil
 	end
-	
+
 	local ServerInterface = {}
 	local ClientInterface = {}
-	
+
 	function ServerInterface.SendTo(Recipient : Player, ... : any) PacketObject.Send(Recipient, ...) end
 	function ServerInterface.SendToAll(... : any) PacketObject.Send(nil, ...) end
 	function ServerInterface.SendToList(Recipients : { Player }, ... : any) for _, Player in ipairs(Recipients) do PacketObject.Send(Player, ...) end end
 	function ServerInterface.Listen(Callback : (Player, ...any) -> ()) PacketObject.Listen(Callback) end
-	
+
 	function ClientInterface.Send(... : any) PacketObject.Send(nil, ...) end
 	function ClientInterface.Listen(Callback : (...any) -> ()) PacketObject.Listen(Callback) end
-	
+
 	return {
 		Server = ServerInterface,
 		Client = ClientInterface
