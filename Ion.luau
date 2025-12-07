@@ -265,6 +265,74 @@ DataTypes.Boolean = {
 	Read = function(TargetBuffer : buffer, CursorPosition : number) CheckBounds(TargetBuffer, CursorPosition, 1); return BufferReadU8(TargetBuffer, CursorPosition) == 1, CursorPosition + 1 end
 } :: TypeSerializer<boolean>
 
+DataTypes.String = {
+	IsDynamic = true, ContainsInstances = false,
+	GetByteSize = function(Value : string) : number return 4 + #Value end,
+	Write = function(TargetBuffer : buffer, CursorPosition : number, Value : string)
+		local Length : number = #Value
+		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 4 + Length)
+		BufferWriteU32(TargetBuffer, CursorPosition, Length)
+		BufferWriteString(TargetBuffer, CursorPosition + 4, Value)
+		return CursorPosition + 4 + Length
+	end,
+	Read = function(TargetBuffer : buffer, CursorPosition : number)
+		CheckBounds(TargetBuffer, CursorPosition, 4)
+		local Length : number = BufferReadU32(TargetBuffer, CursorPosition)
+		CheckBounds(TargetBuffer, CursorPosition + 4, Length)
+		return BufferReadString(TargetBuffer, CursorPosition + 4, Length), CursorPosition + 4 + Length
+	end
+} :: TypeSerializer<string>
+
+DataTypes.ShortString = {
+	IsDynamic = true, ContainsInstances = false,
+	GetByteSize = function(Value : string) : number return 1 + #Value end,
+	Write = function(TargetBuffer : buffer, CursorPosition : number, Value : string)
+		local Length : number = #Value
+		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 1 + Length)
+		BufferWriteU8(TargetBuffer, CursorPosition, Length)
+		BufferWriteString(TargetBuffer, CursorPosition + 1, Value)
+		return CursorPosition + 1 + Length
+	end,
+	Read = function(TargetBuffer : buffer, CursorPosition : number)
+		CheckBounds(TargetBuffer, CursorPosition, 1)
+		local Length : number = BufferReadU8(TargetBuffer, CursorPosition)
+		CheckBounds(TargetBuffer, CursorPosition + 1, Length)
+		return BufferReadString(TargetBuffer, CursorPosition + 1, Length), CursorPosition + 1 + Length
+	end
+} :: TypeSerializer<string>
+
+DataTypes.FixedString = function(Length : number) : TypeSerializer<string>
+	return {
+		IsDynamic = false, ContainsInstances = false,
+		GetByteSize = function(_ : string) : number return Length end,
+		Write = function(TargetBuffer : buffer, CursorPosition : number, Value : string)
+			TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, Length)
+			BufferWriteString(TargetBuffer, CursorPosition, Value, Length)
+			return CursorPosition + Length
+		end,
+		Read = function(TargetBuffer : buffer, CursorPosition : number)
+			CheckBounds(TargetBuffer, CursorPosition, Length)
+			return BufferReadString(TargetBuffer, CursorPosition, Length), CursorPosition + Length
+		end
+	}
+end
+
+DataTypes.RestOfString = {
+	IsDynamic = true, ContainsInstances = false,
+	GetByteSize = function(Value : string) : number return #Value end,
+	Write = function(TargetBuffer : buffer, CursorPosition : number, Value : string)
+		local Length : number = #Value
+		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, Length)
+		BufferWriteString(TargetBuffer, CursorPosition, Value)
+		return CursorPosition + Length
+	end,
+	Read = function(TargetBuffer : buffer, CursorPosition : number)
+		local Remaining : number = BufferLen(TargetBuffer) - CursorPosition
+		CheckBounds(TargetBuffer, CursorPosition, Remaining)
+		return BufferReadString(TargetBuffer, CursorPosition, Remaining), CursorPosition + Remaining
+	end
+} :: TypeSerializer<string>
+
 DataTypes.Instance = {
 	IsDynamic = false, ContainsInstances = true,
 	GetByteSize = function(_ : Instance) : number return 2 end,
@@ -540,42 +608,6 @@ DataTypes.DateTime = {
 	end
 } :: TypeSerializer<DateTime>
 
-DataTypes.String = {
-	IsDynamic = true, ContainsInstances = false,
-	GetByteSize = function(Value : string) : number return 4 + #Value end,
-	Write = function(TargetBuffer : buffer, CursorPosition : number, Value : string)
-		local Length : number = #Value
-		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 4 + Length)
-		BufferWriteU32(TargetBuffer, CursorPosition, Length)
-		BufferWriteString(TargetBuffer, CursorPosition + 4, Value)
-		return CursorPosition + 4 + Length
-	end,
-	Read = function(TargetBuffer : buffer, CursorPosition : number)
-		CheckBounds(TargetBuffer, CursorPosition, 4)
-		local Length : number = BufferReadU32(TargetBuffer, CursorPosition)
-		CheckBounds(TargetBuffer, CursorPosition + 4, Length)
-		return BufferReadString(TargetBuffer, CursorPosition + 4, Length), CursorPosition + 4 + Length
-	end
-} :: TypeSerializer<string>
-
-DataTypes.ShortString = {
-	IsDynamic = true, ContainsInstances = false,
-	GetByteSize = function(Value : string) : number return 1 + #Value end,
-	Write = function(TargetBuffer : buffer, CursorPosition : number, Value : string)
-		local Length : number = #Value
-		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 1 + Length)
-		BufferWriteU8(TargetBuffer, CursorPosition, Length)
-		BufferWriteString(TargetBuffer, CursorPosition + 1, Value)
-		return CursorPosition + 1 + Length
-	end,
-	Read = function(TargetBuffer : buffer, CursorPosition : number)
-		CheckBounds(TargetBuffer, CursorPosition, 1)
-		local Length : number = BufferReadU8(TargetBuffer, CursorPosition)
-		CheckBounds(TargetBuffer, CursorPosition + 1, Length)
-		return BufferReadString(TargetBuffer, CursorPosition + 1, Length), CursorPosition + 1 + Length
-	end
-} :: TypeSerializer<string>
-
 DataTypes.Buffer = {
 	IsDynamic = true, ContainsInstances = false,
 	GetByteSize = function(Value : buffer) : number return 4 + BufferLen(Value) end,
@@ -649,6 +681,54 @@ function DataTypes.Map<K, V>(KeyType : TypeSerializer<K>, ValType : TypeSerializ
 			CursorPosition += 4
 			local Result : { [K] : V } = {}
 			for Index : number = 1, Count do local Key : K, Val : V; Key, CursorPosition = KeyType.Read(TargetBuffer, CursorPosition, InstanceSource); Val, CursorPosition = ValType.Read(TargetBuffer, CursorPosition, InstanceSource); Result[Key] = Val end
+			return Result, CursorPosition
+		end
+	}
+end
+
+function DataTypes.Struct(StructureDefinition : { [string] : TypeSerializer<any> }) : TypeSerializer<{ [string] : any }>
+	local SortedKeys : { string } = {}
+	local HasInstances : boolean = false
+	local IsDynamic : boolean = false
+
+	for DefinitionKey : string, Serializer : TypeSerializer<any> in pairs(StructureDefinition) do
+		table.insert(SortedKeys, DefinitionKey)
+		if Serializer.ContainsInstances then HasInstances = true end
+		if Serializer.IsDynamic then IsDynamic = true end
+	end
+	table.sort(SortedKeys)
+
+	local FieldWriters : { any } = {}
+	local FieldReaders : { any } = {}
+	local FieldSizers : { any } = {}
+
+	for Index : number, Key : string in ipairs(SortedKeys) do
+		local Serializer : TypeSerializer<any> = StructureDefinition[Key]
+		FieldWriters[Index] = Serializer.Write
+		FieldReaders[Index] = Serializer.Read
+		FieldSizers[Index] = Serializer.GetByteSize
+	end
+
+	return {
+		IsDynamic = IsDynamic, ContainsInstances = HasInstances,
+		GetByteSize = function(Value : { [string] : any }) : number
+			local TotalSize : number = 0
+			for Index : number, Key : string in ipairs(SortedKeys) do
+				TotalSize += FieldSizers[Index](Value[Key])
+			end
+			return TotalSize
+		end,
+		Write = function(TargetBuffer : buffer, CursorPosition : number, Value : { [string] : any }, InstanceAccumulator : { Instance }, InstanceLookup : { [Instance] : number })
+			for Index : number, Key : string in ipairs(SortedKeys) do
+				CursorPosition = FieldWriters[Index](TargetBuffer, CursorPosition, Value[Key], InstanceAccumulator, InstanceLookup)
+			end
+			return CursorPosition
+		end,
+		Read = function(TargetBuffer : buffer, CursorPosition : number, InstanceSource : { Instance })
+			local Result : { [string] : any } = {}
+			for Index : number, Key : string in ipairs(SortedKeys) do
+				Result[Key], CursorPosition = FieldReaders[Index](TargetBuffer, CursorPosition, InstanceSource)
+			end
 			return Result, CursorPosition
 		end
 	}
