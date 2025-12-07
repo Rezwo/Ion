@@ -5,6 +5,7 @@
 local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Players = game:GetService("Players")
+local EncodingService = game:GetService("EncodingService")
 
 local BufferWriteU8 = buffer.writeu8
 local BufferWriteU16 = buffer.writeu16
@@ -15,11 +16,9 @@ local BufferWriteI32 = buffer.writei32
 local BufferWriteF32 = buffer.writef32
 local BufferWriteF64 = buffer.writef64
 local BufferWriteString = buffer.writestring
-local BufferWriteBits = buffer.writebits
 local BufferCopy = buffer.copy
 local BufferCreate = buffer.create
 local BufferLen = buffer.len
-
 local BufferReadU8 = buffer.readu8
 local BufferReadU16 = buffer.readu16
 local BufferReadU32 = buffer.readu32
@@ -29,23 +28,28 @@ local BufferReadI32 = buffer.readi32
 local BufferReadF32 = buffer.readf32
 local BufferReadF64 = buffer.readf64
 local BufferReadString = buffer.readstring
-local BufferReadBits = buffer.readbits
 
 local Bit32LShift = bit32.lshift
 local Bit32RShift = bit32.rshift
 local Bit32Band = bit32.band
 local Bit32BTest = bit32.btest
 
-local MathRound = math.round
 local MathFrexp = math.frexp
 local MathLdexp = math.ldexp
 local MathFloor = math.floor
+local MathRound = math.round
+
+local IonVersion : number = 1
+local MaxPacketSize : number = 900
+local BufferPool : { buffer } = table.create(64)
+local PoolCapacity : number = 64
+local PoolBufferSize : number = 4096
 
 export type IonPacket<T...> = {
 	Server : {
 		SendTo : (Recipient : Player, T...) -> (),
 		SendToAll : (T...) -> (),
-		SendToList : (Recipients : {Player}, T...) -> (),
+		SendToList : (Recipients : { Player }, T...) -> (),
 		Listen : (Callback : (Player, T...) -> ()) -> ()
 	},
 	Client : {
@@ -54,1346 +58,881 @@ export type IonPacket<T...> = {
 	}
 }
 
-export type TypeWriter<T = any> = (TargetBuffer : buffer, CurrentOffset : number, ValueToWrite : T, InstanceAccumulator : {Instance}?, InstanceLookup : {[Instance] : number}?) -> number
-export type TypeReader<T = any> = (SourceBuffer : buffer, CurrentOffset : number, InstanceSource : {Instance}?) -> (T, number)
-export type TypeSizer<T = any> = (ValueToCheck : T) -> number
+for PoolIndex : number = 1, PoolCapacity do
+	table.insert(BufferPool, BufferCreate(PoolBufferSize))
+end
 
-export type TypeSerializer<ValueType = any> = {
-	Write : TypeWriter<ValueType>,
-	Read : TypeReader<ValueType>,
-	GetByteSize : TypeSizer<ValueType>,
+local function AcquireBuffer(MinimumSize : number) : buffer
+	if MinimumSize > PoolBufferSize then return BufferCreate(MinimumSize) end
+	return table.remove(BufferPool) or BufferCreate(PoolBufferSize)
+end
+
+local function ReleaseBuffer(BufferToRelease : buffer)
+	if BufferLen(BufferToRelease) == PoolBufferSize and #BufferPool < PoolCapacity then
+		table.insert(BufferPool, BufferToRelease)
+	end
+end
+
+local function EnsureCapacity(TargetBuffer : buffer, CursorPosition : number, Size : number) : buffer
+	local CurrentLength : number = BufferLen(TargetBuffer)
+	if CursorPosition + Size > CurrentLength then
+		local NewLength : number = math.max(CurrentLength * 2, CursorPosition + Size)
+		local NewBuffer : buffer = BufferCreate(NewLength)
+		BufferCopy(NewBuffer, 0, TargetBuffer, 0, CurrentLength)
+		return NewBuffer
+	end
+	return TargetBuffer
+end
+
+local function CheckBounds(TargetBuffer : buffer, CursorPosition : number, Size : number)
+	if CursorPosition + Size > BufferLen(TargetBuffer) then error("Ion: Buffer overflow") end
+end
+
+local function WriteFloat16(TargetBuffer : buffer, CursorPosition : number, Value : number)
+	local Sign : number = if Value < 0 then 0x8000 else 0
+	if Value < 0 then Value = -Value end
+	local Encoded : number = 0
+	if Value ~= 0 then
+		local Mantissa : number, Exponent : number = MathFrexp(Value)
+		Exponent += 14
+		if Exponent <= 0 then
+			Mantissa = MathLdexp(Mantissa, Exponent + 10)
+			Encoded = Sign + MathFloor(Mantissa + 0.5)
+		elseif Exponent >= 32 then
+			Encoded = Sign + 0x7C00
+		else
+			Encoded = Sign + Bit32LShift(Exponent, 10) + MathFloor(Mantissa * 1024 + 0.5) % 1024
+		end
+	end
+	BufferWriteU16(TargetBuffer, CursorPosition, Encoded)
+end
+
+local function ReadFloat16(SourceBuffer : buffer, CursorPosition : number) : number
+	local Encoded : number = BufferReadU16(SourceBuffer, CursorPosition)
+	local Sign : boolean = Bit32BTest(Encoded, 0x8000)
+	local Exponent : number = Bit32RShift(Bit32Band(Encoded, 0x7C00), 10)
+	local Mantissa : number = Bit32Band(Encoded, 0x03FF)
+	if Exponent == 0 then
+		if Mantissa == 0 then return 0 end
+		local Result : number = MathLdexp(Mantissa, -24)
+		return if Sign then -Result else Result
+	elseif Exponent == 31 then
+		return if Mantissa == 0 then (if Sign then -math.huge else math.huge) else 0/0
+	end
+	local Result : number = MathLdexp(Mantissa + 1024, Exponent - 25)
+	return if Sign then -Result else Result
+end
+
+export type TypeSerializer<T> = {
+	Write : (buffer, number, T, { Instance }, { [Instance] : number }) -> number,
+	Read : (buffer, number, { Instance }) -> (T, number),
+	GetByteSize : (T) -> number,
 	IsDynamic : boolean,
 	ContainsInstances : boolean
 }
 
-export type PacketOptions = {
-	Unreliable : boolean?,
-	RateLimit : number?,
-	Dedicated : boolean?
-}
-
-local ReliableChannelName = "IonReliable"
-local UnreliableChannelName = "IonUnreliable"
-local IsServerEnvironment = RunService:IsServer()
-
-local MainReliableRemote : RemoteEvent
-local MainUnreliableRemote : UnreliableRemoteEvent
-
-local SharedInstanceAccumulator : {Instance} = {}
-local SharedInstanceLookupTable : {[Instance] : number} = {}
-
-local function GetRemoteEvent(RemoteName : string, IsUnreliable : boolean) : RemoteEvent | UnreliableRemoteEvent
-	if IsServerEnvironment then
-		local RemoteObject = ReplicatedStorage:FindFirstChild(RemoteName)
-		if not RemoteObject then
-			RemoteObject = Instance.new(if IsUnreliable then "UnreliableRemoteEvent" else "RemoteEvent")
-			RemoteObject.Name = RemoteName
-			RemoteObject.Parent = ReplicatedStorage
-		end
-		return (RemoteObject :: any) :: (RemoteEvent | UnreliableRemoteEvent)
-	else
-		return (ReplicatedStorage:WaitForChild(RemoteName) :: any) :: (RemoteEvent | UnreliableRemoteEvent)
-	end
-end
-
-MainReliableRemote = GetRemoteEvent(ReliableChannelName, false) :: RemoteEvent
-MainUnreliableRemote = GetRemoteEvent(UnreliableChannelName, true) :: UnreliableRemoteEvent
-
-local function WriteFloat16(TargetBuffer : buffer, ByteOffset : number, ValueToWrite : number)
-	local SignBit = if ValueToWrite < 0 then 0x8000 else 0
-	if ValueToWrite < 0 then ValueToWrite = -ValueToWrite end
-
-	local EncodedValue = 0
-	if ValueToWrite ~= 0 then
-		local Mantissa, Exponent = MathFrexp(ValueToWrite)
-		Exponent += 14
-		if Exponent <= 0 then
-			Mantissa = MathLdexp(Mantissa, Exponent + 10)
-			EncodedValue = SignBit + MathFloor(Mantissa + 0.5)
-		elseif Exponent >= 32 then
-			EncodedValue = SignBit + 0x7C00
-		else
-			EncodedValue = SignBit + Bit32LShift(Exponent, 10) + MathFloor(Mantissa * 1024 + 0.5) % 1024
-		end
-	end
-	BufferWriteU16(TargetBuffer, ByteOffset, EncodedValue)
-end
-
-local function ReadFloat16(SourceBuffer : buffer, ByteOffset : number) : number
-	local EncodedValue = BufferReadU16(SourceBuffer, ByteOffset)
-	local SignBit = Bit32BTest(EncodedValue, 0x8000)
-	local Exponent = Bit32RShift(Bit32Band(EncodedValue, 0x7C00), 10)
-	local Mantissa = Bit32Band(EncodedValue, 0x03FF)
-
-	if Exponent == 0 then
-		if Mantissa == 0 then return 0 end
-		local ResultValue = MathLdexp(Mantissa, -24)
-		return if SignBit then -ResultValue else ResultValue
-	elseif Exponent == 31 then
-		return if Mantissa == 0 then (if SignBit then -math.huge else math.huge) else 0/0
-	end
-
-	local ResultValue = MathLdexp(Mantissa + 1024, Exponent - 25)
-	return if SignBit then -ResultValue else ResultValue
-end
-
 local DataTypes = {}
 
-DataTypes.Byte = {
+DataTypes.UInt8 = {
 	IsDynamic = false, ContainsInstances = false,
 	GetByteSize = function(_ : number) : number return 1 end,
-	Write = function(TargetBuffer, CurrentOffset, ValueToWrite) BufferWriteU8(TargetBuffer, CurrentOffset, ValueToWrite or 0); return CurrentOffset + 1 end,
-	Read = function(SourceBuffer, CurrentOffset) return BufferReadU8(SourceBuffer, CurrentOffset), CurrentOffset + 1 end
-} :: TypeSerializer<number>
-
-DataTypes.Int8 = {
-	IsDynamic = false, ContainsInstances = false,
-	GetByteSize = function(_ : number) : number return 1 end,
-	Write = function(TargetBuffer, CurrentOffset, ValueToWrite) BufferWriteI8(TargetBuffer, CurrentOffset, ValueToWrite or 0); return CurrentOffset + 1 end,
-	Read = function(SourceBuffer, CurrentOffset) return BufferReadI8(SourceBuffer, CurrentOffset), CurrentOffset + 1 end
-} :: TypeSerializer<number>
-
-DataTypes.UInt8 = DataTypes.Byte
-
-DataTypes.Int16 = {
-	IsDynamic = false, ContainsInstances = false,
-	GetByteSize = function(_ : number) : number return 2 end,
-	Write = function(TargetBuffer, CurrentOffset, ValueToWrite) BufferWriteI16(TargetBuffer, CurrentOffset, ValueToWrite or 0); return CurrentOffset + 2 end,
-	Read = function(SourceBuffer, CurrentOffset) return BufferReadI16(SourceBuffer, CurrentOffset), CurrentOffset + 2 end
+	Write = function(TargetBuffer : buffer, CursorPosition : number, Value : number) TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 1); BufferWriteU8(TargetBuffer, CursorPosition, Value or 0); return CursorPosition + 1 end,
+	Read = function(TargetBuffer : buffer, CursorPosition : number) CheckBounds(TargetBuffer, CursorPosition, 1); return BufferReadU8(TargetBuffer, CursorPosition), CursorPosition + 1 end
 } :: TypeSerializer<number>
 
 DataTypes.UInt16 = {
 	IsDynamic = false, ContainsInstances = false,
 	GetByteSize = function(_ : number) : number return 2 end,
-	Write = function(TargetBuffer, CurrentOffset, ValueToWrite) BufferWriteU16(TargetBuffer, CurrentOffset, ValueToWrite or 0); return CurrentOffset + 2 end,
-	Read = function(SourceBuffer, CurrentOffset) return BufferReadU16(SourceBuffer, CurrentOffset), CurrentOffset + 2 end
+	Write = function(TargetBuffer : buffer, CursorPosition : number, Value : number) TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 2); BufferWriteU16(TargetBuffer, CursorPosition, Value or 0); return CursorPosition + 2 end,
+	Read = function(TargetBuffer : buffer, CursorPosition : number) CheckBounds(TargetBuffer, CursorPosition, 2); return BufferReadU16(TargetBuffer, CursorPosition), CursorPosition + 2 end
 } :: TypeSerializer<number>
 
 DataTypes.UInt24 = {
 	IsDynamic = false, ContainsInstances = false,
 	GetByteSize = function(_ : number) : number return 3 end,
-	Write = function(TargetBuffer: buffer, CurrentOffset: number, ValueToWrite: number) 
-		BufferWriteBits(TargetBuffer, CurrentOffset * 8, 24, ValueToWrite or 0)
-		return CurrentOffset + 3 
+	Write = function(TargetBuffer : buffer, CursorPosition : number, Value : number) 
+		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 3)
+		local Clamped : number = math.clamp(Value or 0, 0, 16777215)
+		BufferWriteU8(TargetBuffer, CursorPosition, Bit32Band(Bit32RShift(Clamped, 16), 0xFF))
+		BufferWriteU8(TargetBuffer, CursorPosition + 1, Bit32Band(Bit32RShift(Clamped, 8), 0xFF))
+		BufferWriteU8(TargetBuffer, CursorPosition + 2, Bit32Band(Clamped, 0xFF))
+		return CursorPosition + 3 
 	end,
-	Read = function(SourceBuffer: buffer, CurrentOffset: number) 
-		return BufferReadBits(SourceBuffer, CurrentOffset * 8, 24), CurrentOffset + 3 
+	Read = function(TargetBuffer : buffer, CursorPosition : number) 
+		CheckBounds(TargetBuffer, CursorPosition, 3)
+		local B1 : number = BufferReadU8(TargetBuffer, CursorPosition)
+		local B2 : number = BufferReadU8(TargetBuffer, CursorPosition + 1)
+		local B3 : number = BufferReadU8(TargetBuffer, CursorPosition + 2)
+		return Bit32LShift(B1, 16) + Bit32LShift(B2, 8) + B3, CursorPosition + 3 
 	end
-} :: TypeSerializer<number>
-
-DataTypes.Int32 = {
-	IsDynamic = false, ContainsInstances = false,
-	GetByteSize = function(_ : number) : number return 4 end,
-	Write = function(TargetBuffer, CurrentOffset, ValueToWrite) BufferWriteI32(TargetBuffer, CurrentOffset, ValueToWrite or 0); return CurrentOffset + 4 end,
-	Read = function(SourceBuffer, CurrentOffset) return BufferReadI32(SourceBuffer, CurrentOffset), CurrentOffset + 4 end
 } :: TypeSerializer<number>
 
 DataTypes.UInt32 = {
 	IsDynamic = false, ContainsInstances = false,
 	GetByteSize = function(_ : number) : number return 4 end,
-	Write = function(TargetBuffer, CurrentOffset, ValueToWrite) BufferWriteU32(TargetBuffer, CurrentOffset, ValueToWrite or 0); return CurrentOffset + 4 end,
-	Read = function(SourceBuffer, CurrentOffset) return BufferReadU32(SourceBuffer, CurrentOffset), CurrentOffset + 4 end
+	Write = function(TargetBuffer : buffer, CursorPosition : number, Value : number) TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 4); BufferWriteU32(TargetBuffer, CursorPosition, Value or 0); return CursorPosition + 4 end,
+	Read = function(TargetBuffer : buffer, CursorPosition : number) CheckBounds(TargetBuffer, CursorPosition, 4); return BufferReadU32(TargetBuffer, CursorPosition), CursorPosition + 4 end
 } :: TypeSerializer<number>
+
+DataTypes.UInt64 = {
+	IsDynamic = false, ContainsInstances = false,
+	GetByteSize = function(_ : any) : number return 8 end,
+	Write = function(TargetBuffer : buffer, CursorPosition : number, Value : any)
+		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 8)
+		local NumberValue : number = tonumber(Value) or 0
+		local Upper : number = math.floor(NumberValue / 4294967296)
+		local Lower : number = NumberValue % 4294967296
+		BufferWriteU32(TargetBuffer, CursorPosition, Upper)
+		BufferWriteU32(TargetBuffer, CursorPosition + 4, Lower)
+		return CursorPosition + 8
+	end,
+	Read = function(TargetBuffer : buffer, CursorPosition : number)
+		CheckBounds(TargetBuffer, CursorPosition, 8)
+		local Upper : number = BufferReadU32(TargetBuffer, CursorPosition)
+		local Lower : number = BufferReadU32(TargetBuffer, CursorPosition + 4)
+		local Result : string = string.format("%.0f", Upper * 4294967296 + Lower)
+		return Result, CursorPosition + 8
+	end
+} :: TypeSerializer<string>
+
+DataTypes.Int8 = {
+	IsDynamic = false, ContainsInstances = false,
+	GetByteSize = function(_ : number) : number return 1 end,
+	Write = function(TargetBuffer : buffer, CursorPosition : number, Value : number) TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 1); BufferWriteI8(TargetBuffer, CursorPosition, Value or 0); return CursorPosition + 1 end,
+	Read = function(TargetBuffer : buffer, CursorPosition : number) CheckBounds(TargetBuffer, CursorPosition, 1); return BufferReadI8(TargetBuffer, CursorPosition), CursorPosition + 1 end
+} :: TypeSerializer<number>
+
+DataTypes.Int16 = {
+	IsDynamic = false, ContainsInstances = false,
+	GetByteSize = function(_ : number) : number return 2 end,
+	Write = function(TargetBuffer : buffer, CursorPosition : number, Value : number) TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 2); BufferWriteI16(TargetBuffer, CursorPosition, Value or 0); return CursorPosition + 2 end,
+	Read = function(TargetBuffer : buffer, CursorPosition : number) CheckBounds(TargetBuffer, CursorPosition, 2); return BufferReadI16(TargetBuffer, CursorPosition), CursorPosition + 2 end
+} :: TypeSerializer<number>
+
+DataTypes.Int32 = {
+	IsDynamic = false, ContainsInstances = false,
+	GetByteSize = function(_ : number) : number return 4 end,
+	Write = function(TargetBuffer : buffer, CursorPosition : number, Value : number) TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 4); BufferWriteI32(TargetBuffer, CursorPosition, Value or 0); return CursorPosition + 4 end,
+	Read = function(TargetBuffer : buffer, CursorPosition : number) CheckBounds(TargetBuffer, CursorPosition, 4); return BufferReadI32(TargetBuffer, CursorPosition), CursorPosition + 4 end
+} :: TypeSerializer<number>
+
+DataTypes.Int64 = {
+	IsDynamic = false, ContainsInstances = false,
+	GetByteSize = function(_ : any) : number return 8 end,
+	Write = function(TargetBuffer : buffer, CursorPosition : number, Value : any)
+		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 8)
+		local NumberValue : number = tonumber(Value) or 0
+		local High : number = math.floor(NumberValue / 4294967296)
+		local Low : number = NumberValue % 4294967296
+		BufferWriteI32(TargetBuffer, CursorPosition, High)
+		BufferWriteU32(TargetBuffer, CursorPosition + 4, Low)
+		return CursorPosition + 8
+	end,
+	Read = function(TargetBuffer : buffer, CursorPosition : number)
+		CheckBounds(TargetBuffer, CursorPosition, 8)
+		local High : number = BufferReadI32(TargetBuffer, CursorPosition)
+		local Low : number = BufferReadU32(TargetBuffer, CursorPosition + 4)
+		local Result : string = string.format("%.0f", High * 4294967296 + Low)
+		return Result, CursorPosition + 8
+	end
+} :: TypeSerializer<string>
 
 DataTypes.Float16 = {
 	IsDynamic = false, ContainsInstances = false,
 	GetByteSize = function(_ : number) : number return 2 end,
-	Write = function(TargetBuffer, CurrentOffset, ValueToWrite) WriteFloat16(TargetBuffer, CurrentOffset, ValueToWrite or 0); return CurrentOffset + 2 end,
-	Read = function(SourceBuffer, CurrentOffset) return ReadFloat16(SourceBuffer, CurrentOffset), CurrentOffset + 2 end
+	Write = function(TargetBuffer : buffer, CursorPosition : number, Value : number) TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 2); WriteFloat16(TargetBuffer, CursorPosition, Value or 0); return CursorPosition + 2 end,
+	Read = function(TargetBuffer : buffer, CursorPosition : number) CheckBounds(TargetBuffer, CursorPosition, 2); return ReadFloat16(TargetBuffer, CursorPosition), CursorPosition + 2 end
 } :: TypeSerializer<number>
 
 DataTypes.Float32 = {
 	IsDynamic = false, ContainsInstances = false,
 	GetByteSize = function(_ : number) : number return 4 end,
-	Write = function(TargetBuffer, CurrentOffset, ValueToWrite) BufferWriteF32(TargetBuffer, CurrentOffset, ValueToWrite or 0); return CurrentOffset + 4 end,
-	Read = function(SourceBuffer, CurrentOffset) return BufferReadF32(SourceBuffer, CurrentOffset), CurrentOffset + 4 end
+	Write = function(TargetBuffer : buffer, CursorPosition : number, Value : number) TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 4); BufferWriteF32(TargetBuffer, CursorPosition, Value or 0); return CursorPosition + 4 end,
+	Read = function(TargetBuffer : buffer, CursorPosition : number) CheckBounds(TargetBuffer, CursorPosition, 4); return BufferReadF32(TargetBuffer, CursorPosition), CursorPosition + 4 end
 } :: TypeSerializer<number>
 
 DataTypes.Float64 = {
 	IsDynamic = false, ContainsInstances = false,
 	GetByteSize = function(_ : number) : number return 8 end,
-	Write = function(TargetBuffer, CurrentOffset, ValueToWrite) BufferWriteF64(TargetBuffer, CurrentOffset, ValueToWrite or 0); return CurrentOffset + 8 end,
-	Read = function(SourceBuffer, CurrentOffset) return BufferReadF64(SourceBuffer, CurrentOffset), CurrentOffset + 8 end
+	Write = function(TargetBuffer : buffer, CursorPosition : number, Value : number) TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 8); BufferWriteF64(TargetBuffer, CursorPosition, Value or 0); return CursorPosition + 8 end,
+	Read = function(TargetBuffer : buffer, CursorPosition : number) CheckBounds(TargetBuffer, CursorPosition, 8); return BufferReadF64(TargetBuffer, CursorPosition), CursorPosition + 8 end
 } :: TypeSerializer<number>
 
 DataTypes.Boolean = {
 	IsDynamic = false, ContainsInstances = false,
 	GetByteSize = function(_ : boolean) : number return 1 end,
-	Write = function(TargetBuffer, CurrentOffset, ValueToWrite) BufferWriteU8(TargetBuffer, CurrentOffset, if ValueToWrite then 1 else 0); return CurrentOffset + 1 end,
-	Read = function(SourceBuffer, CurrentOffset) return BufferReadU8(SourceBuffer, CurrentOffset) == 1, CurrentOffset + 1 end
+	Write = function(TargetBuffer : buffer, CursorPosition : number, Value : boolean) TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 1); BufferWriteU8(TargetBuffer, CursorPosition, Value and 1 or 0); return CursorPosition + 1 end,
+	Read = function(TargetBuffer : buffer, CursorPosition : number) CheckBounds(TargetBuffer, CursorPosition, 1); return BufferReadU8(TargetBuffer, CursorPosition) == 1, CursorPosition + 1 end
 } :: TypeSerializer<boolean>
 
 DataTypes.Instance = {
 	IsDynamic = false, ContainsInstances = true,
 	GetByteSize = function(_ : Instance) : number return 2 end,
-	Write = function(TargetBuffer, CurrentOffset, ValueToWrite: Instance, InstanceAccumulator: {Instance}?, InstanceLookup: {[Instance] : number}?)
-		if InstanceAccumulator and InstanceLookup then
-			local ExistingIndex = InstanceLookup[ValueToWrite]
-			if ExistingIndex then
-				BufferWriteU16(TargetBuffer, CurrentOffset, ExistingIndex)
+	Write = function(TargetBuffer : buffer, CursorPosition : number, Value : Instance, InstanceAccumulator : { Instance }, InstanceLookup : { [Instance] : number })
+		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 2)
+		if Value and typeof(Value) == "Instance" and Value:IsDescendantOf(game) then
+			local Index : number = InstanceLookup[Value]
+			if Index then BufferWriteU16(TargetBuffer, CursorPosition, Index)
 			else
-				local NewIndex = #InstanceAccumulator + 1
-				InstanceAccumulator[NewIndex] = ValueToWrite
-				InstanceLookup[ValueToWrite] = NewIndex
-				BufferWriteU16(TargetBuffer, CurrentOffset, NewIndex)
+				local NewIndex : number = #InstanceAccumulator + 1
+				InstanceAccumulator[NewIndex] = Value
+				InstanceLookup[Value] = NewIndex
+				BufferWriteU16(TargetBuffer, CursorPosition, NewIndex)
 			end
-		else
-			BufferWriteU16(TargetBuffer, CurrentOffset, 0) 
-		end
-		return CurrentOffset + 2
+		else BufferWriteU16(TargetBuffer, CursorPosition, 0) end
+		return CursorPosition + 2
 	end,
-	Read = function(SourceBuffer, CurrentOffset, InstanceSource)
-		local InstanceIndex = BufferReadU16(SourceBuffer, CurrentOffset)
-		return if InstanceSource and InstanceSource[InstanceIndex] then InstanceSource[InstanceIndex] else nil, CurrentOffset + 2
+	Read = function(TargetBuffer : buffer, CursorPosition : number, InstanceSource : { Instance })
+		CheckBounds(TargetBuffer, CursorPosition, 2)
+		local Index : number = BufferReadU16(TargetBuffer, CursorPosition)
+		return InstanceSource[Index], CursorPosition + 2
 	end
 } :: TypeSerializer<Instance>
 
-DataTypes.Enum = {
-	IsDynamic = false, ContainsInstances = false,
-	GetByteSize = function(_ : EnumItem) : number return 2 end,
-	Write = function(TargetBuffer, CurrentOffset, ValueToWrite: EnumItem) BufferWriteU16(TargetBuffer, CurrentOffset, ValueToWrite.Value); return CurrentOffset + 2 end,
-	Read = function(SourceBuffer, CurrentOffset) return BufferReadU16(SourceBuffer, CurrentOffset), CurrentOffset + 2 end
-} :: TypeSerializer<EnumItem>
+function DataTypes.UseEnum(EnumType : any) : TypeSerializer<EnumItem>
+	return {
+		IsDynamic = false, ContainsInstances = false,
+		GetByteSize = function(_ : EnumItem) : number return 2 end,
+		Write = function(TargetBuffer : buffer, CursorPosition : number, Value : EnumItem) 
+			TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 2)
+			BufferWriteU16(TargetBuffer, CursorPosition, Value.Value)
+			return CursorPosition + 2 
+		end,
+		Read = function(TargetBuffer : buffer, CursorPosition : number) 
+			CheckBounds(TargetBuffer, CursorPosition, 2)
+			local Value : number = BufferReadU16(TargetBuffer, CursorPosition)
+			local Items : { EnumItem } = EnumType:GetEnumItems()
+			for _, Item : EnumItem in ipairs(Items) do
+				if Item.Value == Value then return Item, CursorPosition + 2 end
+			end
+			error("Ion: Invalid Enum value " .. tostring(Value))
+		end
+	}
+end
 
-DataTypes.NativeVector = {
+DataTypes.Vector2 = {
 	IsDynamic = false, ContainsInstances = false,
-	GetByteSize = function(_ : vector) : number return 12 end,
-	Write = function(TargetBuffer, CurrentOffset, ValueToWrite: vector)
-		BufferWriteF32(TargetBuffer, CurrentOffset, ValueToWrite.x)
-		BufferWriteF32(TargetBuffer, CurrentOffset + 4, ValueToWrite.y)
-		BufferWriteF32(TargetBuffer, CurrentOffset + 8, ValueToWrite.z)
-		return CurrentOffset + 12
+	GetByteSize = function(_ : Vector2) : number return 8 end,
+	Write = function(TargetBuffer : buffer, CursorPosition : number, Value : Vector2)
+		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 8)
+		BufferWriteF32(TargetBuffer, CursorPosition, Value.X)
+		BufferWriteF32(TargetBuffer, CursorPosition + 4, Value.Y)
+		return CursorPosition + 8
 	end,
-	Read = function(SourceBuffer, CurrentOffset)
-		return vector.create(BufferReadF32(SourceBuffer, CurrentOffset), BufferReadF32(SourceBuffer, CurrentOffset + 4), BufferReadF32(SourceBuffer, CurrentOffset + 8)), CurrentOffset + 12
+	Read = function(TargetBuffer : buffer, CursorPosition : number)
+		CheckBounds(TargetBuffer, CursorPosition, 8)
+		return Vector2.new(BufferReadF32(TargetBuffer, CursorPosition), BufferReadF32(TargetBuffer, CursorPosition + 4)), CursorPosition + 8
 	end
-} :: TypeSerializer<vector>
+} :: TypeSerializer<Vector2>
 
-DataTypes.Vector3Float32 = {
+DataTypes.Vector3 = {
 	IsDynamic = false, ContainsInstances = false,
 	GetByteSize = function(_ : Vector3) : number return 12 end,
-	Write = function(TargetBuffer, CurrentOffset, ValueToWrite: Vector3)
-		BufferWriteF32(TargetBuffer, CurrentOffset, ValueToWrite.X)
-		BufferWriteF32(TargetBuffer, CurrentOffset + 4, ValueToWrite.Y)
-		BufferWriteF32(TargetBuffer, CurrentOffset + 8, ValueToWrite.Z)
-		return CurrentOffset + 12
+	Write = function(TargetBuffer : buffer, CursorPosition : number, Value : Vector3)
+		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 12)
+		BufferWriteF32(TargetBuffer, CursorPosition, Value.X)
+		BufferWriteF32(TargetBuffer, CursorPosition + 4, Value.Y)
+		BufferWriteF32(TargetBuffer, CursorPosition + 8, Value.Z)
+		return CursorPosition + 12
 	end,
-	Read = function(SourceBuffer, CurrentOffset)
-		return Vector3.new(BufferReadF32(SourceBuffer, CurrentOffset), BufferReadF32(SourceBuffer, CurrentOffset + 4), BufferReadF32(SourceBuffer, CurrentOffset + 8)), CurrentOffset + 12
-	end
-} :: TypeSerializer<Vector3>
-
-DataTypes.Vector3 = DataTypes.Vector3Float32
-
-DataTypes.Vector3Float16 = {
-	IsDynamic = false, ContainsInstances = false,
-	GetByteSize = function(_ : Vector3) : number return 6 end,
-	Write = function(TargetBuffer, CurrentOffset, ValueToWrite: Vector3)
-		WriteFloat16(TargetBuffer, CurrentOffset, ValueToWrite.X)
-		WriteFloat16(TargetBuffer, CurrentOffset + 2, ValueToWrite.Y)
-		WriteFloat16(TargetBuffer, CurrentOffset + 4, ValueToWrite.Z)
-		return CurrentOffset + 6
-	end,
-	Read = function(SourceBuffer, CurrentOffset)
-		return Vector3.new(ReadFloat16(SourceBuffer, CurrentOffset), ReadFloat16(SourceBuffer, CurrentOffset + 2), ReadFloat16(SourceBuffer, CurrentOffset + 4)), CurrentOffset + 6
-	end
-} :: TypeSerializer<Vector3>
-
-DataTypes.Vector3Float64 = {
-	IsDynamic = false, ContainsInstances = false,
-	GetByteSize = function(_ : Vector3) : number return 24 end,
-	Write = function(TargetBuffer, CurrentOffset, ValueToWrite: Vector3)
-		BufferWriteF64(TargetBuffer, CurrentOffset, ValueToWrite.X)
-		BufferWriteF64(TargetBuffer, CurrentOffset + 8, ValueToWrite.Y)
-		BufferWriteF64(TargetBuffer, CurrentOffset + 16, ValueToWrite.Z)
-		return CurrentOffset + 24
-	end,
-	Read = function(SourceBuffer, CurrentOffset)
-		return Vector3.new(BufferReadF64(SourceBuffer, CurrentOffset), BufferReadF64(SourceBuffer, CurrentOffset + 8), BufferReadF64(SourceBuffer, CurrentOffset + 16)), CurrentOffset + 24
-	end
-} :: TypeSerializer<Vector3>
-
-DataTypes.Vector3Int8 = {
-	IsDynamic = false, ContainsInstances = false,
-	GetByteSize = function(_ : Vector3) : number return 3 end,
-	Write = function(TargetBuffer, CurrentOffset, ValueToWrite: Vector3)
-		BufferWriteI8(TargetBuffer, CurrentOffset, MathRound(ValueToWrite.X))
-		BufferWriteI8(TargetBuffer, CurrentOffset + 1, MathRound(ValueToWrite.Y))
-		BufferWriteI8(TargetBuffer, CurrentOffset + 2, MathRound(ValueToWrite.Z))
-		return CurrentOffset + 3
-	end,
-	Read = function(SourceBuffer, CurrentOffset)
-		return Vector3.new(BufferReadI8(SourceBuffer, CurrentOffset), BufferReadI8(SourceBuffer, CurrentOffset + 1), BufferReadI8(SourceBuffer, CurrentOffset + 2)), CurrentOffset + 3
+	Read = function(TargetBuffer : buffer, CursorPosition : number)
+		CheckBounds(TargetBuffer, CursorPosition, 12)
+		return Vector3.new(BufferReadF32(TargetBuffer, CursorPosition), BufferReadF32(TargetBuffer, CursorPosition + 4), BufferReadF32(TargetBuffer, CursorPosition + 8)), CursorPosition + 12
 	end
 } :: TypeSerializer<Vector3>
 
 DataTypes.Vector3Int16 = {
 	IsDynamic = false, ContainsInstances = false,
 	GetByteSize = function(_ : Vector3) : number return 6 end,
-	Write = function(TargetBuffer, CurrentOffset, ValueToWrite: Vector3)
-		BufferWriteI16(TargetBuffer, CurrentOffset, MathRound(ValueToWrite.X))
-		BufferWriteI16(TargetBuffer, CurrentOffset + 2, MathRound(ValueToWrite.Y))
-		BufferWriteI16(TargetBuffer, CurrentOffset + 4, MathRound(ValueToWrite.Z))
-		return CurrentOffset + 6
+	Write = function(TargetBuffer : buffer, CursorPosition : number, Value : Vector3)
+		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 6)
+		BufferWriteI16(TargetBuffer, CursorPosition, MathRound(Value.X))
+		BufferWriteI16(TargetBuffer, CursorPosition + 2, MathRound(Value.Y))
+		BufferWriteI16(TargetBuffer, CursorPosition + 4, MathRound(Value.Z))
+		return CursorPosition + 6
 	end,
-	Read = function(SourceBuffer, CurrentOffset)
-		return Vector3.new(BufferReadI16(SourceBuffer, CurrentOffset), BufferReadI16(SourceBuffer, CurrentOffset + 2), BufferReadI16(SourceBuffer, CurrentOffset + 4)), CurrentOffset + 6
+	Read = function(TargetBuffer : buffer, CursorPosition : number)
+		CheckBounds(TargetBuffer, CursorPosition, 6)
+		return Vector3.new(BufferReadI16(TargetBuffer, CursorPosition), BufferReadI16(TargetBuffer, CursorPosition + 2), BufferReadI16(TargetBuffer, CursorPosition + 4)), CursorPosition + 6
 	end
 } :: TypeSerializer<Vector3>
 
-DataTypes.Vector3Int32 = {
+DataTypes.Vector3Float16 = {
 	IsDynamic = false, ContainsInstances = false,
-	GetByteSize = function(_ : Vector3) : number return 12 end,
-	Write = function(TargetBuffer, CurrentOffset, ValueToWrite: Vector3)
-		BufferWriteI32(TargetBuffer, CurrentOffset, MathRound(ValueToWrite.X))
-		BufferWriteI32(TargetBuffer, CurrentOffset + 4, MathRound(ValueToWrite.Y))
-		BufferWriteI32(TargetBuffer, CurrentOffset + 8, MathRound(ValueToWrite.Z))
-		return CurrentOffset + 12
+	GetByteSize = function(_ : Vector3) : number return 6 end,
+	Write = function(TargetBuffer : buffer, CursorPosition : number, Value : Vector3)
+		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 6)
+		WriteFloat16(TargetBuffer, CursorPosition, Value.X)
+		WriteFloat16(TargetBuffer, CursorPosition + 2, Value.Y)
+		WriteFloat16(TargetBuffer, CursorPosition + 4, Value.Z)
+		return CursorPosition + 6
 	end,
-	Read = function(SourceBuffer, CurrentOffset)
-		return Vector3.new(BufferReadI32(SourceBuffer, CurrentOffset), BufferReadI32(SourceBuffer, CurrentOffset + 4), BufferReadI32(SourceBuffer, CurrentOffset + 8)), CurrentOffset + 12
+	Read = function(TargetBuffer : buffer, CursorPosition : number)
+		CheckBounds(TargetBuffer, CursorPosition, 6)
+		return Vector3.new(ReadFloat16(TargetBuffer, CursorPosition), ReadFloat16(TargetBuffer, CursorPosition + 2), ReadFloat16(TargetBuffer, CursorPosition + 4)), CursorPosition + 6
+	end
+} :: TypeSerializer<Vector3>
+
+DataTypes.Vector3Float64 = {
+	IsDynamic = false, ContainsInstances = false,
+	GetByteSize = function(_ : Vector3) : number return 24 end,
+	Write = function(TargetBuffer : buffer, CursorPosition : number, Value : Vector3)
+		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 24)
+		BufferWriteF64(TargetBuffer, CursorPosition, Value.X)
+		BufferWriteF64(TargetBuffer, CursorPosition + 8, Value.Y)
+		BufferWriteF64(TargetBuffer, CursorPosition + 16, Value.Z)
+		return CursorPosition + 24
+	end,
+	Read = function(TargetBuffer : buffer, CursorPosition : number)
+		CheckBounds(TargetBuffer, CursorPosition, 24)
+		return Vector3.new(BufferReadF64(TargetBuffer, CursorPosition), BufferReadF64(TargetBuffer, CursorPosition + 8), BufferReadF64(TargetBuffer, CursorPosition + 16)), CursorPosition + 24
 	end
 } :: TypeSerializer<Vector3>
 
 DataTypes.CFrame = {
 	IsDynamic = false, ContainsInstances = false,
-	GetByteSize = function(_ : CFrame) : number return 18 end,
-	Write = function(TargetBuffer: buffer, CurrentOffset: number, ValueToWrite: CFrame)
-		BufferWriteF32(TargetBuffer, CurrentOffset, ValueToWrite.X)
-		BufferWriteF32(TargetBuffer, CurrentOffset + 4, ValueToWrite.Y)
-		BufferWriteF32(TargetBuffer, CurrentOffset + 8, ValueToWrite.Z)
-		local EulerAngleX, EulerAngleY, EulerAngleZ = ValueToWrite:ToEulerAnglesXYZ()
-		BufferWriteU16(TargetBuffer, CurrentOffset + 12, EulerAngleX * 10430.2191955 + 0.5)
-		BufferWriteU16(TargetBuffer, CurrentOffset + 14, EulerAngleY * 10430.2191955 + 0.5)
-		BufferWriteU16(TargetBuffer, CurrentOffset + 16, EulerAngleZ * 10430.2191955 + 0.5)
-		return CurrentOffset + 18
+	GetByteSize = function(_ : CFrame) : number return 24 end,
+	Write = function(TargetBuffer : buffer, CursorPosition : number, Value : CFrame)
+		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 24)
+		local PosX : number = Value.X
+		local PosY : number = Value.Y
+		local PosZ : number = Value.Z
+		local Axis : Vector3, Angle : number = Value:ToAxisAngle()
+		BufferWriteF32(TargetBuffer, CursorPosition, PosX)
+		BufferWriteF32(TargetBuffer, CursorPosition + 4, PosY)
+		BufferWriteF32(TargetBuffer, CursorPosition + 8, PosZ)
+		BufferWriteF32(TargetBuffer, CursorPosition + 12, Axis.X)
+		BufferWriteF32(TargetBuffer, CursorPosition + 16, Axis.Y)
+		BufferWriteF32(TargetBuffer, CursorPosition + 20, Axis.Z)
+		return CursorPosition + 24
 	end,
-	Read = function(SourceBuffer, CurrentOffset)
-		local PositionX, PositionY, PositionZ = BufferReadF32(SourceBuffer, CurrentOffset), BufferReadF32(SourceBuffer, CurrentOffset + 4), BufferReadF32(SourceBuffer, CurrentOffset + 8)
-		local EulerAngleX, EulerAngleY, EulerAngleZ = BufferReadU16(SourceBuffer, CurrentOffset + 12) / 10430.2191955, BufferReadU16(SourceBuffer, CurrentOffset + 14) / 10430.2191955, BufferReadU16(SourceBuffer, CurrentOffset + 16) / 10430.2191955
-		return CFrame.fromEulerAnglesXYZ(EulerAngleX, EulerAngleY, EulerAngleZ) + Vector3.new(PositionX, PositionY, PositionZ), CurrentOffset + 18
+	Read = function(TargetBuffer : buffer, CursorPosition : number)
+		CheckBounds(TargetBuffer, CursorPosition, 24)
+		local PosX : number = BufferReadF32(TargetBuffer, CursorPosition)
+		local PosY : number = BufferReadF32(TargetBuffer, CursorPosition + 4)
+		local PosZ : number = BufferReadF32(TargetBuffer, CursorPosition + 8)
+		local AxisX : number = BufferReadF32(TargetBuffer, CursorPosition + 12)
+		local AxisY : number = BufferReadF32(TargetBuffer, CursorPosition + 16)
+		local AxisZ : number = BufferReadF32(TargetBuffer, CursorPosition + 20)
+		local PosV : Vector3 = Vector3.new(PosX, PosY, PosZ)
+		local Axis : Vector3 = Vector3.new(AxisX, AxisY, AxisZ)
+		if Axis.Magnitude < 0.001 then return CFrame.new(PosV), CursorPosition + 24 end
+		return CFrame.fromAxisAngle(Axis, Axis.Magnitude) + PosV, CursorPosition + 24
 	end
 } :: TypeSerializer<CFrame>
 
 DataTypes.CFramePosition = {
 	IsDynamic = false, ContainsInstances = false,
 	GetByteSize = function(_ : CFrame) : number return 12 end,
-	Write = function(TargetBuffer: buffer, CurrentOffset: number, ValueToWrite: CFrame)
-		BufferWriteF32(TargetBuffer, CurrentOffset, ValueToWrite.X)
-		BufferWriteF32(TargetBuffer, CurrentOffset + 4, ValueToWrite.Y)
-		BufferWriteF32(TargetBuffer, CurrentOffset + 8, ValueToWrite.Z)
-		return CurrentOffset + 12
+	Write = function(TargetBuffer : buffer, CursorPosition : number, Value : CFrame)
+		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 12)
+		BufferWriteF32(TargetBuffer, CursorPosition, Value.X)
+		BufferWriteF32(TargetBuffer, CursorPosition + 4, Value.Y)
+		BufferWriteF32(TargetBuffer, CursorPosition + 8, Value.Z)
+		return CursorPosition + 12
 	end,
-	Read = function(SourceBuffer, CurrentOffset)
-		return CFrame.new(BufferReadF32(SourceBuffer, CurrentOffset), BufferReadF32(SourceBuffer, CurrentOffset + 4), BufferReadF32(SourceBuffer, CurrentOffset + 8)), CurrentOffset + 12
+	Read = function(TargetBuffer : buffer, CursorPosition : number)
+		CheckBounds(TargetBuffer, CursorPosition, 12)
+		return CFrame.new(BufferReadF32(TargetBuffer, CursorPosition), BufferReadF32(TargetBuffer, CursorPosition + 4), BufferReadF32(TargetBuffer, CursorPosition + 8)), CursorPosition + 12
 	end
 } :: TypeSerializer<CFrame>
 
 DataTypes.CFrameFloat16 = {
 	IsDynamic = false, ContainsInstances = false,
 	GetByteSize = function(_ : CFrame) : number return 12 end,
-	Write = function(TargetBuffer: buffer, CurrentOffset: number, ValueToWrite: CFrame)
-		WriteFloat16(TargetBuffer, CurrentOffset, ValueToWrite.X)
-		WriteFloat16(TargetBuffer, CurrentOffset + 2, ValueToWrite.Y)
-		WriteFloat16(TargetBuffer, CurrentOffset + 4, ValueToWrite.Z)
-		local EulerAngleX, EulerAngleY, EulerAngleZ = ValueToWrite:ToEulerAnglesXYZ()
-		BufferWriteU16(TargetBuffer, CurrentOffset + 6, EulerAngleX * 10430.2191955 + 0.5)
-		BufferWriteU16(TargetBuffer, CurrentOffset + 8, EulerAngleY * 10430.2191955 + 0.5)
-		BufferWriteU16(TargetBuffer, CurrentOffset + 10, EulerAngleZ * 10430.2191955 + 0.5)
-		return CurrentOffset + 12
+	Write = function(TargetBuffer : buffer, CursorPosition : number, Value : CFrame)
+		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 12)
+		WriteFloat16(TargetBuffer, CursorPosition, Value.X)
+		WriteFloat16(TargetBuffer, CursorPosition + 2, Value.Y)
+		WriteFloat16(TargetBuffer, CursorPosition + 4, Value.Z)
+		local EulerX : number, EulerY : number, EulerZ : number = Value:ToEulerAnglesXYZ()
+		BufferWriteU16(TargetBuffer, CursorPosition + 6, EulerX * 10430.2191955 + 0.5)
+		BufferWriteU16(TargetBuffer, CursorPosition + 8, EulerY * 10430.2191955 + 0.5)
+		BufferWriteU16(TargetBuffer, CursorPosition + 10, EulerZ * 10430.2191955 + 0.5)
+		return CursorPosition + 12
 	end,
-	Read = function(SourceBuffer, CurrentOffset)
-		local PositionX = ReadFloat16(SourceBuffer, CurrentOffset)
-		local PositionY = ReadFloat16(SourceBuffer, CurrentOffset + 2)
-		local PositionZ = ReadFloat16(SourceBuffer, CurrentOffset + 4)
-		local EulerAngleX, EulerAngleY, EulerAngleZ = BufferReadU16(SourceBuffer, CurrentOffset + 6) / 10430.2191955, BufferReadU16(SourceBuffer, CurrentOffset + 8) / 10430.2191955, BufferReadU16(SourceBuffer, CurrentOffset + 10) / 10430.2191955
-		return CFrame.fromEulerAnglesXYZ(EulerAngleX, EulerAngleY, EulerAngleZ) + Vector3.new(PositionX, PositionY, PositionZ), CurrentOffset + 12
-	end
-} :: TypeSerializer<CFrame>
-
-DataTypes.CFrameInt16 = {
-	IsDynamic = false, ContainsInstances = false,
-	GetByteSize = function(_ : CFrame) : number return 12 end,
-	Write = function(TargetBuffer: buffer, CurrentOffset: number, ValueToWrite: CFrame)
-		BufferWriteI16(TargetBuffer, CurrentOffset, MathRound(ValueToWrite.X))
-		BufferWriteI16(TargetBuffer, CurrentOffset + 2, MathRound(ValueToWrite.Y))
-		BufferWriteI16(TargetBuffer, CurrentOffset + 4, MathRound(ValueToWrite.Z))
-		local EulerAngleX, EulerAngleY, EulerAngleZ = ValueToWrite:ToEulerAnglesXYZ()
-		BufferWriteU16(TargetBuffer, CurrentOffset + 6, EulerAngleX * 10430.2191955 + 0.5)
-		BufferWriteU16(TargetBuffer, CurrentOffset + 8, EulerAngleY * 10430.2191955 + 0.5)
-		BufferWriteU16(TargetBuffer, CurrentOffset + 10, EulerAngleZ * 10430.2191955 + 0.5)
-		return CurrentOffset + 12
-	end,
-	Read = function(SourceBuffer, CurrentOffset)
-		local PositionX, PositionY, PositionZ = BufferReadI16(SourceBuffer, CurrentOffset), BufferReadI16(SourceBuffer, CurrentOffset + 2), BufferReadI16(SourceBuffer, CurrentOffset + 4)
-		local EulerAngleX, EulerAngleY, EulerAngleZ = BufferReadU16(SourceBuffer, CurrentOffset + 6) / 10430.2191955, BufferReadU16(SourceBuffer, CurrentOffset + 8) / 10430.2191955, BufferReadU16(SourceBuffer, CurrentOffset + 10) / 10430.2191955
-		return CFrame.fromEulerAnglesXYZ(EulerAngleX, EulerAngleY, EulerAngleZ) + Vector3.new(PositionX, PositionY, PositionZ), CurrentOffset + 12
+	Read = function(TargetBuffer : buffer, CursorPosition : number)
+		CheckBounds(TargetBuffer, CursorPosition, 12)
+		local PosX : number = ReadFloat16(TargetBuffer, CursorPosition)
+		local PosY : number = ReadFloat16(TargetBuffer, CursorPosition + 2)
+		local PosZ : number = ReadFloat16(TargetBuffer, CursorPosition + 4)
+		local EulerX : number = BufferReadU16(TargetBuffer, CursorPosition + 6) / 10430.2191955
+		local EulerY : number = BufferReadU16(TargetBuffer, CursorPosition + 8) / 10430.2191955
+		local EulerZ : number = BufferReadU16(TargetBuffer, CursorPosition + 10) / 10430.2191955
+		return CFrame.fromEulerAnglesXYZ(EulerX, EulerY, EulerZ) + Vector3.new(PosX, PosY, PosZ), CursorPosition + 12
 	end
 } :: TypeSerializer<CFrame>
 
 DataTypes.CFrameHighPrecision = {
 	IsDynamic = false, ContainsInstances = false,
 	GetByteSize = function(_ : CFrame) : number return 30 end,
-	Write = function(TargetBuffer: buffer, CurrentOffset: number, ValueToWrite: CFrame)
-		BufferWriteF64(TargetBuffer, CurrentOffset, ValueToWrite.X)
-		BufferWriteF64(TargetBuffer, CurrentOffset + 8, ValueToWrite.Y)
-		BufferWriteF64(TargetBuffer, CurrentOffset + 16, ValueToWrite.Z)
-		local EulerAngleX, EulerAngleY, EulerAngleZ = ValueToWrite:ToEulerAnglesXYZ()
-		BufferWriteU16(TargetBuffer, CurrentOffset + 24, EulerAngleX * 10430.2191955 + 0.5)
-		BufferWriteU16(TargetBuffer, CurrentOffset + 26, EulerAngleY * 10430.2191955 + 0.5)
-		BufferWriteU16(TargetBuffer, CurrentOffset + 28, EulerAngleZ * 10430.2191955 + 0.5)
-		return CurrentOffset + 30
+	Write = function(TargetBuffer : buffer, CursorPosition : number, Value : CFrame)
+		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 30)
+		BufferWriteF64(TargetBuffer, CursorPosition, Value.X)
+		BufferWriteF64(TargetBuffer, CursorPosition + 8, Value.Y)
+		BufferWriteF64(TargetBuffer, CursorPosition + 16, Value.Z)
+		local EulerX : number, EulerY : number, EulerZ : number = Value:ToEulerAnglesXYZ()
+		BufferWriteU16(TargetBuffer, CursorPosition + 24, EulerX * 10430.2191955 + 0.5)
+		BufferWriteU16(TargetBuffer, CursorPosition + 26, EulerY * 10430.2191955 + 0.5)
+		BufferWriteU16(TargetBuffer, CursorPosition + 28, EulerZ * 10430.2191955 + 0.5)
+		return CursorPosition + 30
 	end,
-	Read = function(SourceBuffer, CurrentOffset)
-		local PositionX, PositionY, PositionZ = BufferReadF64(SourceBuffer, CurrentOffset), BufferReadF64(SourceBuffer, CurrentOffset + 8), BufferReadF64(SourceBuffer, CurrentOffset + 16)
-		local EulerAngleX, EulerAngleY, EulerAngleZ = BufferReadU16(SourceBuffer, CurrentOffset + 24) / 10430.2191955, BufferReadU16(SourceBuffer, CurrentOffset + 26) / 10430.2191955, BufferReadU16(SourceBuffer, CurrentOffset + 28) / 10430.2191955
-		return CFrame.fromEulerAnglesXYZ(EulerAngleX, EulerAngleY, EulerAngleZ) + Vector3.new(PositionX, PositionY, PositionZ), CurrentOffset + 30
+	Read = function(TargetBuffer : buffer, CursorPosition : number)
+		CheckBounds(TargetBuffer, CursorPosition, 30)
+		local PosX : number = BufferReadF64(TargetBuffer, CursorPosition)
+		local PosY : number = BufferReadF64(TargetBuffer, CursorPosition + 8)
+		local PosZ : number = BufferReadF64(TargetBuffer, CursorPosition + 16)
+		local EulerX : number = BufferReadU16(TargetBuffer, CursorPosition + 24) / 10430.2191955
+		local EulerY : number = BufferReadU16(TargetBuffer, CursorPosition + 26) / 10430.2191955
+		local EulerZ : number = BufferReadU16(TargetBuffer, CursorPosition + 28) / 10430.2191955
+		return CFrame.fromEulerAnglesXYZ(EulerX, EulerY, EulerZ) + Vector3.new(PosX, PosY, PosZ), CursorPosition + 30
 	end
 } :: TypeSerializer<CFrame>
+
+DataTypes.UDim2 = {
+	IsDynamic = false, ContainsInstances = false,
+	GetByteSize = function(_ : UDim2) : number return 16 end,
+	Write = function(TargetBuffer : buffer, CursorPosition : number, Value : UDim2)
+		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 16)
+		BufferWriteF32(TargetBuffer, CursorPosition, Value.X.Scale)
+		BufferWriteI32(TargetBuffer, CursorPosition + 4, Value.X.Offset)
+		BufferWriteF32(TargetBuffer, CursorPosition + 8, Value.Y.Scale)
+		BufferWriteI32(TargetBuffer, CursorPosition + 12, Value.Y.Offset)
+		return CursorPosition + 16
+	end,
+	Read = function(TargetBuffer : buffer, CursorPosition : number)
+		CheckBounds(TargetBuffer, CursorPosition, 16)
+		local ScaleX : number = BufferReadF32(TargetBuffer, CursorPosition)
+		local OffsetX : number = BufferReadI32(TargetBuffer, CursorPosition + 4)
+		local ScaleY : number = BufferReadF32(TargetBuffer, CursorPosition + 8)
+		local OffsetY : number = BufferReadI32(TargetBuffer, CursorPosition + 12)
+		return UDim2.new(ScaleX, OffsetX, ScaleY, OffsetY), CursorPosition + 16
+	end
+} :: TypeSerializer<UDim2>
 
 DataTypes.Color3 = {
 	IsDynamic = false, ContainsInstances = false,
 	GetByteSize = function(_ : Color3) : number return 3 end,
-	Write = function(TargetBuffer, CurrentOffset, ValueToWrite: Color3)
-		BufferWriteU8(TargetBuffer, CurrentOffset, MathRound(ValueToWrite.R * 255))
-		BufferWriteU8(TargetBuffer, CurrentOffset+1, MathRound(ValueToWrite.G * 255))
-		BufferWriteU8(TargetBuffer, CurrentOffset+2, MathRound(ValueToWrite.B * 255))
-		return CurrentOffset + 3
+	Write = function(TargetBuffer : buffer, CursorPosition : number, Value : Color3)
+		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 3)
+		BufferWriteU8(TargetBuffer, CursorPosition, MathRound(Value.R * 255))
+		BufferWriteU8(TargetBuffer, CursorPosition + 1, MathRound(Value.G * 255))
+		BufferWriteU8(TargetBuffer, CursorPosition + 2, MathRound(Value.B * 255))
+		return CursorPosition + 3
 	end,
-	Read = function(SourceBuffer, CurrentOffset)
-		return Color3.fromRGB(BufferReadU8(SourceBuffer, CurrentOffset), BufferReadU8(SourceBuffer, CurrentOffset+1), BufferReadU8(SourceBuffer, CurrentOffset+2)), CurrentOffset + 3 
+	Read = function(TargetBuffer : buffer, CursorPosition : number)
+		CheckBounds(TargetBuffer, CursorPosition, 3)
+		return Color3.fromRGB(BufferReadU8(TargetBuffer, CursorPosition), BufferReadU8(TargetBuffer, CursorPosition + 1), BufferReadU8(TargetBuffer, CursorPosition + 2)), CursorPosition + 3
 	end
 } :: TypeSerializer<Color3>
 
+DataTypes.DateTime = {
+	IsDynamic = false, ContainsInstances = false,
+	GetByteSize = function(_ : DateTime) : number return 8 end,
+	Write = function(TargetBuffer : buffer, CursorPosition : number, Value : DateTime)
+		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 8)
+		BufferWriteF64(TargetBuffer, CursorPosition, Value.UnixTimestampMillis)
+		return CursorPosition + 8
+	end,
+	Read = function(TargetBuffer : buffer, CursorPosition : number)
+		CheckBounds(TargetBuffer, CursorPosition, 8)
+		return DateTime.fromUnixTimestampMillis(BufferReadF64(TargetBuffer, CursorPosition)), CursorPosition + 8
+	end
+} :: TypeSerializer<DateTime>
+
 DataTypes.String = {
 	IsDynamic = true, ContainsInstances = false,
-	GetByteSize = function(ValueToWrite : string) : number return 2 + #ValueToWrite end,
-	Write = function(TargetBuffer, CurrentOffset, ValueToWrite)
-		local StringLength = #ValueToWrite
-		BufferWriteU16(TargetBuffer, CurrentOffset, StringLength)
-		BufferWriteString(TargetBuffer, CurrentOffset + 2, ValueToWrite)
-		return CurrentOffset + 2 + StringLength
+	GetByteSize = function(Value : string) : number return 4 + #Value end,
+	Write = function(TargetBuffer : buffer, CursorPosition : number, Value : string)
+		local Length : number = #Value
+		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 4 + Length)
+		BufferWriteU32(TargetBuffer, CursorPosition, Length)
+		BufferWriteString(TargetBuffer, CursorPosition + 4, Value)
+		return CursorPosition + 4 + Length
 	end,
-	Read = function(SourceBuffer, CurrentOffset)
-		local StringLength = BufferReadU16(SourceBuffer, CurrentOffset)
-		return BufferReadString(SourceBuffer, CurrentOffset + 2, StringLength), CurrentOffset + 2 + StringLength
+	Read = function(TargetBuffer : buffer, CursorPosition : number)
+		CheckBounds(TargetBuffer, CursorPosition, 4)
+		local Length : number = BufferReadU32(TargetBuffer, CursorPosition)
+		CheckBounds(TargetBuffer, CursorPosition + 4, Length)
+		return BufferReadString(TargetBuffer, CursorPosition + 4, Length), CursorPosition + 4 + Length
 	end
 } :: TypeSerializer<string>
 
 DataTypes.ShortString = {
 	IsDynamic = true, ContainsInstances = false,
-	GetByteSize = function(ValueToWrite : string) : number return 1 + #ValueToWrite end,
-	Write = function(TargetBuffer, CurrentOffset, ValueToWrite)
-		local StringLength = #ValueToWrite
-		BufferWriteU8(TargetBuffer, CurrentOffset, StringLength)
-		BufferWriteString(TargetBuffer, CurrentOffset + 1, ValueToWrite)
-		return CurrentOffset + 1 + StringLength
+	GetByteSize = function(Value : string) : number return 1 + #Value end,
+	Write = function(TargetBuffer : buffer, CursorPosition : number, Value : string)
+		local Length : number = #Value
+		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 1 + Length)
+		BufferWriteU8(TargetBuffer, CursorPosition, Length)
+		BufferWriteString(TargetBuffer, CursorPosition + 1, Value)
+		return CursorPosition + 1 + Length
 	end,
-	Read = function(SourceBuffer, CurrentOffset)
-		local StringLength = BufferReadU8(SourceBuffer, CurrentOffset)
-		return BufferReadString(SourceBuffer, CurrentOffset + 1, StringLength), CurrentOffset + 1 + StringLength
-	end
-} :: TypeSerializer<string>
-
-DataTypes.RestOfString = {
-	IsDynamic = true, ContainsInstances = false,
-	GetByteSize = function(ValueToWrite : string) : number return #ValueToWrite end,
-	Write = function(TargetBuffer, CurrentOffset, ValueToWrite)
-		BufferWriteString(TargetBuffer, CurrentOffset, ValueToWrite)
-		return CurrentOffset + #ValueToWrite
-	end,
-	Read = function(SourceBuffer, CurrentOffset)
-		local RemainingLength = BufferLen(SourceBuffer) - CurrentOffset
-		return BufferReadString(SourceBuffer, CurrentOffset, RemainingLength), CurrentOffset + RemainingLength
+	Read = function(TargetBuffer : buffer, CursorPosition : number)
+		CheckBounds(TargetBuffer, CursorPosition, 1)
+		local Length : number = BufferReadU8(TargetBuffer, CursorPosition)
+		CheckBounds(TargetBuffer, CursorPosition + 1, Length)
+		return BufferReadString(TargetBuffer, CursorPosition + 1, Length), CursorPosition + 1 + Length
 	end
 } :: TypeSerializer<string>
 
 DataTypes.Buffer = {
 	IsDynamic = true, ContainsInstances = false,
-	GetByteSize = function(ValueToWrite : buffer) : number return 2 + BufferLen(ValueToWrite) end,
-	Write = function(TargetBuffer, CurrentOffset, ValueToWrite)
-		local BufferLength = BufferLen(ValueToWrite)
-		BufferWriteU16(TargetBuffer, CurrentOffset, BufferLength)
-		BufferCopy(TargetBuffer, CurrentOffset + 2, ValueToWrite, 0, BufferLength)
-		return CurrentOffset + 2 + BufferLength
+	GetByteSize = function(Value : buffer) : number return 4 + BufferLen(Value) end,
+	Write = function(TargetBuffer : buffer, CursorPosition : number, Value : buffer)
+		local Length : number = BufferLen(Value)
+		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 4 + Length)
+		BufferWriteU32(TargetBuffer, CursorPosition, Length)
+		BufferCopy(TargetBuffer, CursorPosition + 4, Value, 0, Length)
+		return CursorPosition + 4 + Length
 	end,
-	Read = function(SourceBuffer, CurrentOffset)
-		local BufferLength = BufferReadU16(SourceBuffer, CurrentOffset)
-		local NewBuffer = BufferCreate(BufferLength)
-		BufferCopy(NewBuffer, 0, SourceBuffer, CurrentOffset + 2, BufferLength)
-		return NewBuffer, CurrentOffset + 2 + BufferLength
+	Read = function(TargetBuffer : buffer, CursorPosition : number)
+		CheckBounds(TargetBuffer, CursorPosition, 4)
+		local Length : number = BufferReadU32(TargetBuffer, CursorPosition)
+		CheckBounds(TargetBuffer, CursorPosition + 4, Length)
+		local NewBuffer : buffer = BufferCreate(Length)
+		BufferCopy(NewBuffer, 0, TargetBuffer, CursorPosition + 4, Length)
+		return NewBuffer, CursorPosition + 4 + Length
 	end
 } :: TypeSerializer<buffer>
 
-function DataTypes.FixedString(StringLength : number) : TypeSerializer<string>
+function DataTypes.Array<T>(Inner : TypeSerializer<T>) : TypeSerializer<{ T }>
 	return {
-		IsDynamic = false, ContainsInstances = false,
-		GetByteSize = function(_ : string) : number return StringLength end,
-		Write = function(TargetBuffer, CurrentOffset, ValueToWrite) 
-			BufferWriteString(TargetBuffer, CurrentOffset, ValueToWrite, StringLength) 
-			return CurrentOffset + StringLength 
+		IsDynamic = true, ContainsInstances = Inner.ContainsInstances,
+		GetByteSize = function(Value : { T }) : number
+			if not Inner.IsDynamic then
+				return 4 + (#Value * Inner.GetByteSize(nil :: any))
+			end
+			local Size : number = 4
+			for _, Item : T in ipairs(Value) do Size += Inner.GetByteSize(Item) end
+			return Size
 		end,
-		Read = function(SourceBuffer, CurrentOffset) 
-			return BufferReadString(SourceBuffer, CurrentOffset, StringLength), CurrentOffset + StringLength 
+		Write = function(TargetBuffer : buffer, CursorPosition : number, Value : { T }, InstanceAccumulator : { Instance }, InstanceLookup : { [Instance] : number })
+			local Count : number = #Value
+			TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 4)
+			BufferWriteU32(TargetBuffer, CursorPosition, Count)
+			CursorPosition += 4
+			for Index : number = 1, Count do CursorPosition = Inner.Write(TargetBuffer, CursorPosition, Value[Index], InstanceAccumulator, InstanceLookup) end
+			return CursorPosition
+		end,
+		Read = function(TargetBuffer : buffer, CursorPosition : number, InstanceSource : { Instance })
+			CheckBounds(TargetBuffer, CursorPosition, 4)
+			local Count : number = BufferReadU32(TargetBuffer, CursorPosition)
+			CursorPosition += 4
+			local Result : { T } = table.create(Count)
+			for Index : number = 1, Count do local Item : T; Item, CursorPosition = Inner.Read(TargetBuffer, CursorPosition, InstanceSource); Result[Index] = Item end
+			return Result, CursorPosition
 		end
 	}
 end
 
-function DataTypes.Optional<ValueType>(InnerType : TypeSerializer<ValueType>) : TypeSerializer<ValueType?>
-	local InnerWrite, InnerRead, InnerSize = InnerType.Write, InnerType.Read, InnerType.GetByteSize
+function DataTypes.Map<K, V>(KeyType : TypeSerializer<K>, ValType : TypeSerializer<V>) : TypeSerializer<{ [K] : V }>
 	return {
-		IsDynamic = true, ContainsInstances = InnerType.ContainsInstances,
-		GetByteSize = function(ValueToWrite) return if ValueToWrite == nil then 1 else 1 + InnerSize(ValueToWrite) end,
-		Write = function(TargetBuffer, CurrentOffset, ValueToWrite, InstanceAccumulator, InstanceLookup)
-			if ValueToWrite == nil then
-				BufferWriteU8(TargetBuffer, CurrentOffset, 0)
-				return CurrentOffset + 1
-			else
-				BufferWriteU8(TargetBuffer, CurrentOffset, 1)
-				return InnerWrite(TargetBuffer, CurrentOffset + 1, ValueToWrite, InstanceAccumulator, InstanceLookup)
-			end
+		IsDynamic = true, ContainsInstances = KeyType.ContainsInstances or ValType.ContainsInstances,
+		GetByteSize = function(Value : { [K] : V }) : number
+			local Size : number = 4
+			for Key : K, Val : V in pairs(Value) do Size += KeyType.GetByteSize(Key) + ValType.GetByteSize(Val) end
+			return Size
 		end,
-		Read = function(SourceBuffer, CurrentOffset, InstanceSource)
-			if BufferReadU8(SourceBuffer, CurrentOffset) == 0 then return nil, CurrentOffset + 1
-			else return InnerRead(SourceBuffer, CurrentOffset + 1, InstanceSource) end
+		Write = function(TargetBuffer : buffer, CursorPosition : number, Value : { [K] : V }, InstanceAccumulator : { Instance }, InstanceLookup : { [Instance] : number })
+			local Count : number = 0
+			for _ in pairs(Value) do Count += 1 end
+			TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 4)
+			BufferWriteU32(TargetBuffer, CursorPosition, Count)
+			CursorPosition += 4
+			for Key : K, Val : V in pairs(Value) do CursorPosition = KeyType.Write(TargetBuffer, CursorPosition, Key, InstanceAccumulator, InstanceLookup); CursorPosition = ValType.Write(TargetBuffer, CursorPosition, Val, InstanceAccumulator, InstanceLookup) end
+			return CursorPosition
+		end,
+		Read = function(TargetBuffer : buffer, CursorPosition : number, InstanceSource : { Instance })
+			CheckBounds(TargetBuffer, CursorPosition, 4)
+			local Count : number = BufferReadU32(TargetBuffer, CursorPosition)
+			CursorPosition += 4
+			local Result : { [K] : V } = {}
+			for Index : number = 1, Count do local Key : K, Val : V; Key, CursorPosition = KeyType.Read(TargetBuffer, CursorPosition, InstanceSource); Val, CursorPosition = ValType.Read(TargetBuffer, CursorPosition, InstanceSource); Result[Key] = Val end
+			return Result, CursorPosition
 		end
 	}
 end
 
-function DataTypes.Array<ValueType>(InnerType : TypeSerializer<ValueType>) : TypeSerializer<{ValueType}>
-	local InnerWrite, InnerRead, InnerSize = InnerType.Write, InnerType.Read, InnerType.GetByteSize
-	local InnerIsDynamic = InnerType.IsDynamic
-
-	return {
-		IsDynamic = true, ContainsInstances = InnerType.ContainsInstances,
-		GetByteSize = function(ValuesToWrite)
-			local TotalSize = 2
-			if InnerIsDynamic then
-				for _, Item in ipairs(ValuesToWrite) do TotalSize += InnerSize(Item) end
-			else
-				TotalSize += (#ValuesToWrite * InnerSize(nil :: any))
-			end
-			return TotalSize
-		end,
-		Write = function(TargetBuffer, CurrentOffset, ValuesToWrite, InstanceAccumulator, InstanceLookup)
-			local ItemCount = #ValuesToWrite
-			BufferWriteU16(TargetBuffer, CurrentOffset, ItemCount)
-			CurrentOffset += 2
-			for Index = 1, ItemCount do 
-				CurrentOffset = InnerWrite(TargetBuffer, CurrentOffset, ValuesToWrite[Index], InstanceAccumulator, InstanceLookup) 
-			end
-			return CurrentOffset
-		end,
-		Read = function(SourceBuffer, CurrentOffset, InstanceSource)
-			local ItemCount = BufferReadU16(SourceBuffer, CurrentOffset)
-			CurrentOffset += 2
-			local ResultTable = table.create(ItemCount)
-			for Index = 1, ItemCount do
-				local DecodedValue
-				DecodedValue, CurrentOffset = InnerRead(SourceBuffer, CurrentOffset, InstanceSource)
-				ResultTable[Index] = DecodedValue
-			end
-			return ResultTable, CurrentOffset
-		end
-	}
-end
-
-function DataTypes.Map<KeyType, ValueType>(KeyTypeSerializer : TypeSerializer<KeyType>, ValueTypeSerializer : TypeSerializer<ValueType>) : TypeSerializer<{[KeyType]: ValueType}>
-	local KeyWrite, KeyRead, KeySize = KeyTypeSerializer.Write, KeyTypeSerializer.Read, KeyTypeSerializer.GetByteSize
-	local ValWrite, ValRead, ValSize = ValueTypeSerializer.Write, ValueTypeSerializer.Read, ValueTypeSerializer.GetByteSize
-
-	return {
-		IsDynamic = true, ContainsInstances = KeyTypeSerializer.ContainsInstances or ValueTypeSerializer.ContainsInstances,
-		GetByteSize = function(MapValues)
-			local TotalSize = 2 
-			for Key, Value in pairs(MapValues) do
-				TotalSize += KeySize(Key)
-				TotalSize += ValSize(Value)
-			end
-			return TotalSize
-		end,
-		Write = function(TargetBuffer, CurrentOffset, MapValues, InstanceAccumulator, InstanceLookup)
-			local MapCount = 0; for _ in pairs(MapValues) do MapCount += 1 end
-			BufferWriteU16(TargetBuffer, CurrentOffset, MapCount)
-			CurrentOffset += 2
-			for Key, Value in pairs(MapValues) do
-				CurrentOffset = KeyWrite(TargetBuffer, CurrentOffset, Key, InstanceAccumulator, InstanceLookup)
-				CurrentOffset = ValWrite(TargetBuffer, CurrentOffset, Value, InstanceAccumulator, InstanceLookup)
-			end
-			return CurrentOffset
-		end,
-		Read = function(SourceBuffer, CurrentOffset, InstanceSource)
-			local MapCount = BufferReadU16(SourceBuffer, CurrentOffset)
-			CurrentOffset += 2
-			local ResultMap = {}
-			for _ = 1, MapCount do
-				local DecodedKey, DecodedValue
-				DecodedKey, CurrentOffset = KeyRead(SourceBuffer, CurrentOffset, InstanceSource)
-				DecodedValue, CurrentOffset = ValRead(SourceBuffer, CurrentOffset, InstanceSource)
-				ResultMap[DecodedKey] = DecodedValue
-			end
-			return ResultMap, CurrentOffset
-		end
-	}
-end
-
-function DataTypes.Struct(StructureDefinition: {[string]: TypeSerializer}) : TypeSerializer<{ [string]: any }>
-	local SortedKeys = {}
-	local HasInstances = false
-	local IsDynamic = false
-
-	for DefinitionKey, Serializer in pairs(StructureDefinition) do
-		table.insert(SortedKeys, DefinitionKey)
-		if Serializer.ContainsInstances then HasInstances = true end
-		if Serializer.IsDynamic then IsDynamic = true end
-	end
-	table.sort(SortedKeys)
-
-	local FieldWriters, FieldReaders, FieldSizers = {}, {}, {}
-	for Index, Key in ipairs(SortedKeys) do
-		local Serializer = StructureDefinition[Key]
-		FieldWriters[Index] = Serializer.Write
-		FieldReaders[Index] = Serializer.Read
-		FieldSizers[Index] = Serializer.GetByteSize
-	end
-
-	return {
-		IsDynamic = IsDynamic, ContainsInstances = HasInstances,
-		GetByteSize = function(ValueToWrite)
-			local TotalSize = 0
-			for Index, DefinitionKey in ipairs(SortedKeys) do
-				local FieldValue = if ValueToWrite then ValueToWrite[DefinitionKey] else nil
-				TotalSize += FieldSizers[Index](FieldValue)
-			end
-			return TotalSize
-		end,
-		Write = function(TargetBuffer, CurrentOffset, ValueToWrite, InstanceAccumulator, InstanceLookup)
-			for Index, DefinitionKey in ipairs(SortedKeys) do
-				CurrentOffset = FieldWriters[Index](TargetBuffer, CurrentOffset, ValueToWrite[DefinitionKey], InstanceAccumulator, InstanceLookup)
-			end
-			return CurrentOffset
-		end,
-		Read = function(SourceBuffer, CurrentOffset, InstanceSource)
-			local ResultTable = {}
-			for Index, DefinitionKey in ipairs(SortedKeys) do
-				ResultTable[DefinitionKey], CurrentOffset = FieldReaders[Index](SourceBuffer, CurrentOffset, InstanceSource)
-			end
-			return ResultTable, CurrentOffset
-		end
-	}
-end
-
+local AnyTypeHandler : TypeSerializer<any>
 do
-	local DATA_TYPE_NIL              = 0
-	local DATA_TYPE_FALSE            = 1
-	local DATA_TYPE_TRUE             = 2
-	local DATA_TYPE_F64              = 3
-	local DATA_TYPE_F32              = 4
-	local DATA_TYPE_INT32            = 5
-	local DATA_TYPE_INT16            = 6
-	local DATA_TYPE_INT8             = 7
-	local DATA_TYPE_VECTOR3          = 8
-	local DATA_TYPE_VECTOR3_ZERO     = 9
-	local DATA_TYPE_VECTOR3_ONE      = 10
-	local DATA_TYPE_VECTOR3_INT16    = 11
-	local DATA_TYPE_CFRAME           = 12
-	local DATA_TYPE_COLOR3           = 13
-	local DATA_TYPE_INSTANCE         = 14
-	local DATA_TYPE_BUFFER_16        = 15
-	local DATA_TYPE_BUFFER_32        = 16
-	local DATA_TYPE_STRING_LONG      = 17
-	local DATA_TYPE_ARRAY_LONG       = 18
-	local DATA_TYPE_MAP_LONG         = 19
-	local DATA_TYPE_VECTOR3_INT8     = 20
+	local function WriteAny(TargetBuffer : buffer, CursorPosition : number, Value : any, InstanceAccumulator : { Instance }, InstanceLookup : { [Instance] : number }) : number
+		local Type : string = typeof(Value)
+		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 1)
 
-	local DATA_TYPE_CF_IDENTITY_ZERO  = 21
-	local DATA_TYPE_CF_IDENTITY_INT8  = 22
-	local DATA_TYPE_CF_IDENTITY_INT16 = 23
-	local DATA_TYPE_CF_IDENTITY_F32   = 24
-	local DATA_TYPE_CF_ROTATION_INT8  = 25
-	local DATA_TYPE_CF_ROTATION_F32   = 26
-
-	local OFFSET_ARRAY_SHORT  = 32
-	local OFFSET_MAP_SHORT    = 64
-	local OFFSET_STRING_SHORT = 128
-
-	local GetAnyByteSize : (any) -> number
-	local WriteAny : (buffer, number, any, {Instance}?, {[Instance]: number}?) -> number
-	local ReadAny : (buffer, number, {Instance}?) -> (any, number)
-
-	local function IsTableArray(TableToCheck: {any}) : boolean
-		if #TableToCheck == 0 then return false end
-		local ElementCount = 0
-		for _ in pairs(TableToCheck) do ElementCount += 1 end
-		return ElementCount == #TableToCheck
+		if Value == nil then BufferWriteU8(TargetBuffer, CursorPosition, 0); return CursorPosition + 1
+		elseif Type == "string" then BufferWriteU8(TargetBuffer, CursorPosition, 3); return DataTypes.String.Write(TargetBuffer, CursorPosition + 1, Value, InstanceAccumulator, InstanceLookup)
+		elseif Type == "number" then BufferWriteU8(TargetBuffer, CursorPosition, 2); return DataTypes.Float64.Write(TargetBuffer, CursorPosition + 1, Value, InstanceAccumulator, InstanceLookup)
+		elseif Type == "boolean" then BufferWriteU8(TargetBuffer, CursorPosition, 1); return DataTypes.Boolean.Write(TargetBuffer, CursorPosition + 1, Value, InstanceAccumulator, InstanceLookup)
+		elseif Type == "Instance" then BufferWriteU8(TargetBuffer, CursorPosition, 4); return DataTypes.Instance.Write(TargetBuffer, CursorPosition + 1, Value, InstanceAccumulator, InstanceLookup)
+		elseif Type == "Vector3" then BufferWriteU8(TargetBuffer, CursorPosition, 5); return DataTypes.Vector3.Write(TargetBuffer, CursorPosition + 1, Value, InstanceAccumulator, InstanceLookup)
+		elseif Type == "CFrame" then BufferWriteU8(TargetBuffer, CursorPosition, 7); return DataTypes.CFrame.Write(TargetBuffer, CursorPosition + 1, Value, InstanceAccumulator, InstanceLookup)
+		elseif Type == "EnumItem" then BufferWriteU8(TargetBuffer, CursorPosition, 6); return DataTypes.UInt16.Write(TargetBuffer, CursorPosition + 1, Value.Value, InstanceAccumulator, InstanceLookup)
+		else error("Ion: Unsupported Any type " .. Type) end
 	end
 
-	GetAnyByteSize = function(ValueToCheck: any) : number
-		local ValueType = typeof(ValueToCheck)
-
-		if ValueType == "string" then
-			local StringLength = #ValueToCheck
-			return if StringLength < 128 then 1 + StringLength else 5 + StringLength
-		elseif ValueType == "number" then
-			if ValueToCheck % 1 == 0 then
-				if ValueToCheck >= -128 and ValueToCheck <= 127 then return 2
-				elseif ValueToCheck >= -32768 and ValueToCheck <= 32767 then return 3
-				elseif ValueToCheck >= -2147483648 and ValueToCheck <= 2147483647 then return 5
-				end
-			end
-			return 9
-		elseif ValueType == "Vector3" then
-			if ValueToCheck == Vector3.zero or ValueToCheck == Vector3.one then return 1 end
-			local VectorX, VectorY, VectorZ = ValueToCheck.X, ValueToCheck.Y, ValueToCheck.Z
-			if VectorX % 1 == 0 and VectorY % 1 == 0 and VectorZ % 1 == 0 then
-				if VectorX >= -128 and VectorX <= 127 and VectorY >= -128 and VectorY <= 127 and VectorZ >= -128 and VectorZ <= 127 then
-					return 4
-				elseif VectorX >= -32768 and VectorX <= 32767 and VectorY >= -32768 and VectorY <= 32767 and VectorZ >= -32768 and VectorZ <= 32767 then
-					return 7
-				end
-			end
-			return 13
-		elseif ValueType == "boolean" then
-			return 1
-		elseif ValueType == "nil" then
-			return 1
-		elseif ValueType == "table" then
-			local TotalSize = 1
-			if IsTableArray(ValueToCheck) then
-				local ElementCount = #ValueToCheck
-				if ElementCount >= 32 then TotalSize += 2 end
-				for _, SubValue in ipairs(ValueToCheck) do TotalSize += GetAnyByteSize(SubValue) end
-			else
-				local ElementCount = 0
-				for Key, SubValue in pairs(ValueToCheck) do
-					ElementCount += 1
-					TotalSize += GetAnyByteSize(Key)
-					TotalSize += GetAnyByteSize(SubValue)
-				end
-				if ElementCount >= 32 then TotalSize += 2 end
-			end
-			return TotalSize
-		elseif ValueType == "CFrame" then
-			local PositionX, PositionY, PositionZ, RotationMatrix00, RotationMatrix01, RotationMatrix02, RotationMatrix10, RotationMatrix11, RotationMatrix12, RotationMatrix20, RotationMatrix21, RotationMatrix22 = ValueToCheck:GetComponents()
-			local IsIdentityRotation = (RotationMatrix00 == 1 and RotationMatrix11 == 1 and RotationMatrix22 == 1 and RotationMatrix01 == 0 and RotationMatrix02 == 0 and RotationMatrix10 == 0 and RotationMatrix12 == 0 and RotationMatrix20 == 0 and RotationMatrix21 == 0)
-
-			if IsIdentityRotation then
-				if PositionX == 0 and PositionY == 0 and PositionZ == 0 then return 1 end
-				if PositionX % 1 == 0 and PositionY % 1 == 0 and PositionZ % 1 == 0 then
-					if PositionX >= -128 and PositionX <= 127 and PositionY >= -128 and PositionY <= 127 and PositionZ >= -128 and PositionZ <= 127 then return 4 end
-					if PositionX >= -32768 and PositionX <= 32767 and PositionY >= -32768 and PositionY <= 32767 and PositionZ >= -32768 and PositionZ <= 32767 then return 7 end
-				end
-				return 13
-			else
-				if PositionX % 1 == 0 and PositionY % 1 == 0 and PositionZ % 1 == 0 then
-					if PositionX >= -128 and PositionX <= 127 and PositionY >= -128 and PositionY <= 127 and PositionZ >= -128 and PositionZ <= 127 then
-						return 10 
-					end
-				end
-				return 19 
-			end
-		elseif ValueType == "Color3" then
-			return 4
-		elseif ValueType == "Instance" then
-			return 3
-		elseif ValueType == "buffer" then
-			local BufferLength = BufferLen(ValueToCheck)
-			return if BufferLength < 65536 then 3 + BufferLength else 5 + BufferLength
-		else
-			error("Ion: Unsupported type in Any serializer: " .. ValueType)
-		end
+	local function ReadAny(TargetBuffer : buffer, CursorPosition : number, InstanceSource : { Instance }) : (any, number)
+		CheckBounds(TargetBuffer, CursorPosition, 1)
+		local TypeId : number = BufferReadU8(TargetBuffer, CursorPosition)
+		CursorPosition += 1
+		if TypeId == 0 then return nil, CursorPosition
+		elseif TypeId == 3 then return DataTypes.String.Read(TargetBuffer, CursorPosition, InstanceSource)
+		elseif TypeId == 2 then return DataTypes.Float64.Read(TargetBuffer, CursorPosition, InstanceSource)
+		elseif TypeId == 1 then return DataTypes.Boolean.Read(TargetBuffer, CursorPosition, InstanceSource)
+		elseif TypeId == 4 then return DataTypes.Instance.Read(TargetBuffer, CursorPosition, InstanceSource)
+		elseif TypeId == 5 then return DataTypes.Vector3.Read(TargetBuffer, CursorPosition, InstanceSource)
+		elseif TypeId == 7 then return DataTypes.CFrame.Read(TargetBuffer, CursorPosition, InstanceSource)
+		elseif TypeId == 6 then return DataTypes.UInt16.Read(TargetBuffer, CursorPosition, InstanceSource)
+		else error("Ion: Corrupt Any type") end
 	end
 
-	WriteAny = function(TargetBuffer: buffer, CurrentOffset: number, ValueToWrite: any, InstanceAccumulator: {Instance}?, InstanceLookup: {[Instance]: number}?) : number
-		local ValueType = typeof(ValueToWrite)
-		if ValueType == "Instance" then
-			BufferWriteU8(TargetBuffer, CurrentOffset, DATA_TYPE_INSTANCE)
-			if InstanceAccumulator and InstanceLookup then
-				local ExistingIndex = InstanceLookup[ValueToWrite :: Instance]
-				if ExistingIndex then
-					BufferWriteU16(TargetBuffer, CurrentOffset + 1, ExistingIndex)
-				else
-					local NewIndex = #InstanceAccumulator + 1
-					InstanceAccumulator[NewIndex] = ValueToWrite :: Instance
-					InstanceLookup[ValueToWrite :: Instance] = NewIndex
-					BufferWriteU16(TargetBuffer, CurrentOffset + 1, NewIndex)
-				end
-			else
-				BufferWriteU16(TargetBuffer, CurrentOffset + 1, 0)
-			end
-			return CurrentOffset + 3
-		elseif ValueType == "string" then
-			local StringLength = #ValueToWrite
-			if StringLength < 128 then
-				BufferWriteU8(TargetBuffer, CurrentOffset, OFFSET_STRING_SHORT + StringLength)
-				BufferWriteString(TargetBuffer, CurrentOffset + 1, ValueToWrite)
-				return CurrentOffset + 1 + StringLength
-			else
-				BufferWriteU8(TargetBuffer, CurrentOffset, DATA_TYPE_STRING_LONG)
-				BufferWriteU32(TargetBuffer, CurrentOffset + 1, StringLength)
-				BufferWriteString(TargetBuffer, CurrentOffset + 5, ValueToWrite)
-				return CurrentOffset + 5 + StringLength
-			end
-		elseif ValueType == "number" then
-			if ValueToWrite % 1 == 0 then
-				if ValueToWrite >= -128 and ValueToWrite <= 127 then
-					BufferWriteU8(TargetBuffer, CurrentOffset, DATA_TYPE_INT8)
-					BufferWriteI8(TargetBuffer, CurrentOffset + 1, ValueToWrite)
-					return CurrentOffset + 2
-				elseif ValueToWrite >= -32768 and ValueToWrite <= 32767 then
-					BufferWriteU8(TargetBuffer, CurrentOffset, DATA_TYPE_INT16)
-					BufferWriteI16(TargetBuffer, CurrentOffset + 1, ValueToWrite)
-					return CurrentOffset + 3
-				elseif ValueToWrite >= -2147483648 and ValueToWrite <= 2147483647 then
-					BufferWriteU8(TargetBuffer, CurrentOffset, DATA_TYPE_INT32)
-					BufferWriteI32(TargetBuffer, CurrentOffset + 1, ValueToWrite)
-					return CurrentOffset + 5
-				end
-			end
-			BufferWriteU8(TargetBuffer, CurrentOffset, DATA_TYPE_F64)
-			BufferWriteF64(TargetBuffer, CurrentOffset + 1, ValueToWrite)
-			return CurrentOffset + 9
-		elseif ValueType == "Vector3" then
-			if ValueToWrite == Vector3.zero then
-				BufferWriteU8(TargetBuffer, CurrentOffset, DATA_TYPE_VECTOR3_ZERO)
-				return CurrentOffset + 1
-			elseif ValueToWrite == Vector3.one then
-				BufferWriteU8(TargetBuffer, CurrentOffset, DATA_TYPE_VECTOR3_ONE)
-				return CurrentOffset + 1
-			end
+	AnyTypeHandler = { IsDynamic = true, ContainsInstances = true, GetByteSize = function(Value : any) : number return 10 end, Write = WriteAny, Read = ReadAny }
+end
+DataTypes.Any = AnyTypeHandler
 
-			local VectorX, VectorY, VectorZ = ValueToWrite.X, ValueToWrite.Y, ValueToWrite.Z
-			if VectorX % 1 == 0 and VectorY % 1 == 0 and VectorZ % 1 == 0 then
-				if VectorX >= -128 and VectorX <= 127 and VectorY >= -128 and VectorY <= 127 and VectorZ >= -128 and VectorZ <= 127 then
-					BufferWriteU8(TargetBuffer, CurrentOffset, DATA_TYPE_VECTOR3_INT8)
-					BufferWriteI8(TargetBuffer, CurrentOffset + 1, VectorX)
-					BufferWriteI8(TargetBuffer, CurrentOffset + 2, VectorY)
-					BufferWriteI8(TargetBuffer, CurrentOffset + 3, VectorZ)
-					return CurrentOffset + 4
-				elseif VectorX >= -32768 and VectorX <= 32767 and VectorY >= -32768 and VectorY <= 32767 and VectorZ >= -32768 and VectorZ <= 32767 then
-					BufferWriteU8(TargetBuffer, CurrentOffset, DATA_TYPE_VECTOR3_INT16)
-					BufferWriteI16(TargetBuffer, CurrentOffset + 1, VectorX)
-					BufferWriteI16(TargetBuffer, CurrentOffset + 3, VectorY)
-					BufferWriteI16(TargetBuffer, CurrentOffset + 5, VectorZ)
-					return CurrentOffset + 7
-				end
-			end
-			BufferWriteU8(TargetBuffer, CurrentOffset, DATA_TYPE_VECTOR3)
-			BufferWriteF32(TargetBuffer, CurrentOffset + 1, VectorX)
-			BufferWriteF32(TargetBuffer, CurrentOffset + 5, VectorY)
-			BufferWriteF32(TargetBuffer, CurrentOffset + 9, VectorZ)
-			return CurrentOffset + 13
-		elseif ValueType == "boolean" then
-			BufferWriteU8(TargetBuffer, CurrentOffset, if ValueToWrite then DATA_TYPE_TRUE else DATA_TYPE_FALSE)
-			return CurrentOffset + 1
-		elseif ValueType == "nil" then
-			BufferWriteU8(TargetBuffer, CurrentOffset, DATA_TYPE_NIL)
-			return CurrentOffset + 1
-		elseif ValueType == "table" then
-			if IsTableArray(ValueToWrite) then
-				local ElementCount = #ValueToWrite
-				if ElementCount < 32 then
-					BufferWriteU8(TargetBuffer, CurrentOffset, OFFSET_ARRAY_SHORT + ElementCount)
-					CurrentOffset += 1
-				else
-					BufferWriteU8(TargetBuffer, CurrentOffset, DATA_TYPE_ARRAY_LONG)
-					BufferWriteU16(TargetBuffer, CurrentOffset + 1, ElementCount)
-					CurrentOffset += 3
-				end
-				for Index = 1, ElementCount do CurrentOffset = WriteAny(TargetBuffer, CurrentOffset, ValueToWrite[Index], InstanceAccumulator, InstanceLookup) end
-				return CurrentOffset
-			else
-				local ElementCount = 0; for _ in pairs(ValueToWrite) do ElementCount += 1 end
-				if ElementCount < 32 then
-					BufferWriteU8(TargetBuffer, CurrentOffset, OFFSET_MAP_SHORT + ElementCount)
-					CurrentOffset += 1
-				else
-					BufferWriteU8(TargetBuffer, CurrentOffset, DATA_TYPE_MAP_LONG)
-					BufferWriteU16(TargetBuffer, CurrentOffset + 1, ElementCount)
-					CurrentOffset += 3
-				end
-				for Key, Value in pairs(ValueToWrite) do
-					CurrentOffset = WriteAny(TargetBuffer, CurrentOffset, Key, InstanceAccumulator, InstanceLookup)
-					CurrentOffset = WriteAny(TargetBuffer, CurrentOffset, Value, InstanceAccumulator, InstanceLookup)
-				end
-				return CurrentOffset
-			end
-		elseif ValueType == "CFrame" then
-			local PositionX, PositionY, PositionZ, RotationMatrix00, RotationMatrix01, RotationMatrix02, RotationMatrix10, RotationMatrix11, RotationMatrix12, RotationMatrix20, RotationMatrix21, RotationMatrix22 = ValueToWrite:GetComponents()
-			local IsIdentityRotation = (RotationMatrix00 == 1 and RotationMatrix11 == 1 and RotationMatrix22 == 1 and RotationMatrix01 == 0 and RotationMatrix02 == 0 and RotationMatrix10 == 0 and RotationMatrix12 == 0 and RotationMatrix20 == 0 and RotationMatrix21 == 0)
+local Definitions : { [number] : { TypeSerializer<any> } } = {}
+local Listeners : { [number] : (...any) -> () } = {}
+local RemoteCache : { [number] : RemoteEvent | UnreliableRemoteEvent } = {}
 
-			if IsIdentityRotation then
-				if PositionX == 0 and PositionY == 0 and PositionZ == 0 then
-					BufferWriteU8(TargetBuffer, CurrentOffset, DATA_TYPE_CF_IDENTITY_ZERO)
-					return CurrentOffset + 1
-				end
+type RateLimit = { Tokens : number, LastUpdate : number, RefillRate : number, Capacity : number }
+local RateLimiters : { [number] : { [Player] : RateLimit } } = {}
+local GlobalRateLimitPerPlayer : { [Player] : RateLimit } = {}
+local GlobalLimitSettings : number? = nil
 
-				if PositionX % 1 == 0 and PositionY % 1 == 0 and PositionZ % 1 == 0 then
-					if PositionX >= -128 and PositionX <= 127 and PositionY >= -128 and PositionY <= 127 and PositionZ >= -128 and PositionZ <= 127 then
-						BufferWriteU8(TargetBuffer, CurrentOffset, DATA_TYPE_CF_IDENTITY_INT8)
-						BufferWriteI8(TargetBuffer, CurrentOffset + 1, PositionX)
-						BufferWriteI8(TargetBuffer, CurrentOffset + 2, PositionY)
-						BufferWriteI8(TargetBuffer, CurrentOffset + 3, PositionZ)
-						return CurrentOffset + 4
-					elseif PositionX >= -32768 and PositionX <= 32767 and PositionY >= -32768 and PositionY <= 32767 and PositionZ >= -32768 and PositionZ <= 32767 then
-						BufferWriteU8(TargetBuffer, CurrentOffset, DATA_TYPE_CF_IDENTITY_INT16)
-						BufferWriteI16(TargetBuffer, CurrentOffset + 1, PositionX)
-						BufferWriteI16(TargetBuffer, CurrentOffset + 3, PositionY)
-						BufferWriteI16(TargetBuffer, CurrentOffset + 5, PositionZ)
-						return CurrentOffset + 7
-					end
-				end
-				BufferWriteU8(TargetBuffer, CurrentOffset, DATA_TYPE_CF_IDENTITY_F32)
-				BufferWriteF32(TargetBuffer, CurrentOffset + 1, PositionX)
-				BufferWriteF32(TargetBuffer, CurrentOffset + 5, PositionY)
-				BufferWriteF32(TargetBuffer, CurrentOffset + 9, PositionZ)
-				return CurrentOffset + 13
-			else
-				local EulerAngleX, EulerAngleY, EulerAngleZ = ValueToWrite:ToEulerAnglesXYZ()
-				local EncodedRotationX = EulerAngleX * 10430.2191955 + 0.5
-				local EncodedRotationY = EulerAngleY * 10430.2191955 + 0.5
-				local EncodedRotationZ = EulerAngleZ * 10430.2191955 + 0.5
+type Stats = { TotalBytesSent : number, TotalBytesReceived : number, PacketsSent : number, PacketsReceived : number }
+local GlobalStats : Stats = { TotalBytesSent = 0, TotalBytesReceived = 0, PacketsSent = 0, PacketsReceived = 0 }
 
-				if PositionX % 1 == 0 and PositionY % 1 == 0 and PositionZ % 1 == 0 then
-					if PositionX >= -128 and PositionX <= 127 and PositionY >= -128 and PositionY <= 127 and PositionZ >= -128 and PositionZ <= 127 then
-						BufferWriteU8(TargetBuffer, CurrentOffset, DATA_TYPE_CF_ROTATION_INT8)
-						BufferWriteI8(TargetBuffer, CurrentOffset + 1, PositionX)
-						BufferWriteI8(TargetBuffer, CurrentOffset + 2, PositionY)
-						BufferWriteI8(TargetBuffer, CurrentOffset + 3, PositionZ)
-						BufferWriteU16(TargetBuffer, CurrentOffset + 4, EncodedRotationX)
-						BufferWriteU16(TargetBuffer, CurrentOffset + 6, EncodedRotationY)
-						BufferWriteU16(TargetBuffer, CurrentOffset + 8, EncodedRotationZ)
-						return CurrentOffset + 10
-					end
-				end
+type Middleware = {
+	OnBeforeSend : ((...any) -> boolean)?,
+	OnAfterReceived : ((...any) -> ())?
+}
 
-				BufferWriteU8(TargetBuffer, CurrentOffset, DATA_TYPE_CF_ROTATION_F32)
-				BufferWriteF32(TargetBuffer, CurrentOffset + 1, PositionX)
-				BufferWriteF32(TargetBuffer, CurrentOffset + 5, PositionY)
-				BufferWriteF32(TargetBuffer, CurrentOffset + 9, PositionZ)
-				BufferWriteU16(TargetBuffer, CurrentOffset + 13, EncodedRotationX)
-				BufferWriteU16(TargetBuffer, CurrentOffset + 15, EncodedRotationY)
-				BufferWriteU16(TargetBuffer, CurrentOffset + 17, EncodedRotationZ)
-				return CurrentOffset + 19
-			end
-
-		elseif ValueType == "Color3" then
-			BufferWriteU8(TargetBuffer, CurrentOffset, DATA_TYPE_COLOR3)
-			BufferWriteU8(TargetBuffer, CurrentOffset + 1, MathRound(ValueToWrite.R * 255))
-			BufferWriteU8(TargetBuffer, CurrentOffset + 2, MathRound(ValueToWrite.G * 255))
-			BufferWriteU8(TargetBuffer, CurrentOffset + 3, MathRound(ValueToWrite.B * 255))
-			return CurrentOffset + 4
-		elseif ValueType == "buffer" then
-			local BufferLength = BufferLen(ValueToWrite)
-			if BufferLength < 65536 then
-				BufferWriteU8(TargetBuffer, CurrentOffset, DATA_TYPE_BUFFER_16)
-				BufferWriteU16(TargetBuffer, CurrentOffset + 1, BufferLength)
-				BufferCopy(TargetBuffer, CurrentOffset + 3, ValueToWrite, 0, BufferLength)
-				return CurrentOffset + 3 + BufferLength
-			else
-				BufferWriteU8(TargetBuffer, CurrentOffset, DATA_TYPE_BUFFER_32)
-				BufferWriteU32(TargetBuffer, CurrentOffset + 1, BufferLength)
-				BufferCopy(TargetBuffer, CurrentOffset + 5, ValueToWrite, 0, BufferLength)
-				return CurrentOffset + 5 + BufferLength
-			end
-		end
-		error("Ion: Unserializable type in Any: " .. ValueType)
+local function GetRateLimiter(PacketId : number, Player : Player, Rate : number) : RateLimit
+	local PacketCache = RateLimiters[PacketId]
+	if not PacketCache then PacketCache = {}; RateLimiters[PacketId] = PacketCache end
+	local Limiter : RateLimit = PacketCache[Player]
+	if not Limiter then
+		Limiter = { Tokens = Rate, LastUpdate = os.clock(), RefillRate = Rate, Capacity = Rate * 2 }
+		PacketCache[Player] = Limiter
 	end
-
-	local function ReadArray(SourceBuffer : buffer, CurrentOffset : number, InstanceSource : {Instance}?, ElementCount : number) : ({any}, number)
-		local ResultTable = table.create(ElementCount)
-		for Index = 1, ElementCount do local DecodedValue; DecodedValue, CurrentOffset = ReadAny(SourceBuffer, CurrentOffset, InstanceSource); ResultTable[Index] = DecodedValue end
-		return ResultTable, CurrentOffset
-	end
-
-	local function ReadMap(SourceBuffer : buffer, CurrentOffset : number, InstanceSource : {Instance}?, ElementCount : number) : ({[any] : any}, number)
-		local ResultTable = {}
-		for _ = 1, ElementCount do local DecodedKey, DecodedValue; DecodedKey, CurrentOffset = ReadAny(SourceBuffer, CurrentOffset, InstanceSource); DecodedValue, CurrentOffset = ReadAny(SourceBuffer, CurrentOffset, InstanceSource); ResultTable[DecodedKey] = DecodedValue end
-		return ResultTable, CurrentOffset
-	end
-
-	local StaticTypeHandlers: { [number] : (buffer, number, {Instance}?) -> (any, number) } = {}
-
-	StaticTypeHandlers[DATA_TYPE_NIL] = function(SourceBuffer, CurrentOffset, InstanceSource) return nil, CurrentOffset end
-	StaticTypeHandlers[DATA_TYPE_FALSE] = function(SourceBuffer, CurrentOffset, InstanceSource) return false, CurrentOffset end
-	StaticTypeHandlers[DATA_TYPE_TRUE] = function(SourceBuffer, CurrentOffset, InstanceSource) return true, CurrentOffset end
-	StaticTypeHandlers[DATA_TYPE_F64] = function(SourceBuffer, CurrentOffset, InstanceSource) return BufferReadF64(SourceBuffer, CurrentOffset), CurrentOffset + 8 end
-	StaticTypeHandlers[DATA_TYPE_INT8] = function(SourceBuffer, CurrentOffset, InstanceSource) return BufferReadI8(SourceBuffer, CurrentOffset), CurrentOffset + 1 end
-	StaticTypeHandlers[DATA_TYPE_INT16] = function(SourceBuffer, CurrentOffset, InstanceSource) return BufferReadI16(SourceBuffer, CurrentOffset), CurrentOffset + 2 end
-	StaticTypeHandlers[DATA_TYPE_INT32] = function(SourceBuffer, CurrentOffset, InstanceSource) return BufferReadI32(SourceBuffer, CurrentOffset), CurrentOffset + 4 end
-	StaticTypeHandlers[DATA_TYPE_VECTOR3] = function(SourceBuffer, CurrentOffset, InstanceSource) return Vector3.new(BufferReadF32(SourceBuffer,CurrentOffset), BufferReadF32(SourceBuffer,CurrentOffset+4), BufferReadF32(SourceBuffer,CurrentOffset+8)), CurrentOffset + 12 end
-	StaticTypeHandlers[DATA_TYPE_VECTOR3_ZERO] = function(SourceBuffer, CurrentOffset, InstanceSource) return Vector3.zero, CurrentOffset end
-	StaticTypeHandlers[DATA_TYPE_VECTOR3_ONE] = function(SourceBuffer, CurrentOffset, InstanceSource) return Vector3.one, CurrentOffset end
-	StaticTypeHandlers[DATA_TYPE_VECTOR3_INT16] = function(SourceBuffer, CurrentOffset, InstanceSource) return Vector3.new(BufferReadI16(SourceBuffer,CurrentOffset), BufferReadI16(SourceBuffer,CurrentOffset+2), BufferReadI16(SourceBuffer,CurrentOffset+4)), CurrentOffset + 6 end
-	StaticTypeHandlers[DATA_TYPE_VECTOR3_INT8] = function(SourceBuffer, CurrentOffset, InstanceSource) return Vector3.new(BufferReadI8(SourceBuffer,CurrentOffset), BufferReadI8(SourceBuffer,CurrentOffset+1), BufferReadI8(SourceBuffer,CurrentOffset+2)), CurrentOffset + 3 end
-	StaticTypeHandlers[DATA_TYPE_COLOR3] = function(SourceBuffer, CurrentOffset, InstanceSource) return Color3.fromRGB(BufferReadU8(SourceBuffer,CurrentOffset), BufferReadU8(SourceBuffer,CurrentOffset+1), BufferReadU8(SourceBuffer,CurrentOffset+2)), CurrentOffset + 3 end
-	StaticTypeHandlers[DATA_TYPE_INSTANCE] = function(SourceBuffer, CurrentOffset, InstanceSource: {Instance}?) local InstanceIndex = BufferReadU16(SourceBuffer, CurrentOffset); return if InstanceSource and InstanceSource[InstanceIndex] then InstanceSource[InstanceIndex] else nil, CurrentOffset + 2 end
-	StaticTypeHandlers[DATA_TYPE_BUFFER_16] = function(SourceBuffer, CurrentOffset, InstanceSource) local BufferLength = BufferReadU16(SourceBuffer, CurrentOffset); local NewBuffer = BufferCreate(BufferLength); BufferCopy(NewBuffer, 0, SourceBuffer, CurrentOffset+2, BufferLength); return NewBuffer, CurrentOffset + 2 + BufferLength end
-	StaticTypeHandlers[DATA_TYPE_BUFFER_32] = function(SourceBuffer, CurrentOffset, InstanceSource) local BufferLength = BufferReadU32(SourceBuffer, CurrentOffset); local NewBuffer = BufferCreate(BufferLength); BufferCopy(NewBuffer, 0, SourceBuffer, CurrentOffset+4, BufferLength); return NewBuffer, CurrentOffset + 4 + BufferLength end
-	StaticTypeHandlers[DATA_TYPE_STRING_LONG] = function(SourceBuffer, CurrentOffset, InstanceSource) local StringLength = BufferReadU32(SourceBuffer, CurrentOffset); return BufferReadString(SourceBuffer, CurrentOffset+4, StringLength), CurrentOffset + 4 + StringLength end
-
-	StaticTypeHandlers[DATA_TYPE_CFRAME] = function(SourceBuffer, CurrentOffset, InstanceSource)
-		local PositionX, PositionY, PositionZ = BufferReadF32(SourceBuffer, CurrentOffset), BufferReadF32(SourceBuffer, CurrentOffset+4), BufferReadF32(SourceBuffer, CurrentOffset+8)
-		local EulerAngleX, EulerAngleY, EulerAngleZ = BufferReadU16(SourceBuffer, CurrentOffset+12) / 10430.2191955, BufferReadU16(SourceBuffer, CurrentOffset+14) / 10430.2191955, BufferReadU16(SourceBuffer, CurrentOffset+16) / 10430.2191955
-		return CFrame.fromEulerAnglesXYZ(EulerAngleX, EulerAngleY, EulerAngleZ) + Vector3.new(PositionX, PositionY, PositionZ), CurrentOffset + 20
-	end
-
-	StaticTypeHandlers[DATA_TYPE_CF_IDENTITY_ZERO] = function(SourceBuffer, CurrentOffset, InstanceSource) return CFrame.new(), CurrentOffset end
-	StaticTypeHandlers[DATA_TYPE_CF_IDENTITY_INT8] = function(SourceBuffer, CurrentOffset, InstanceSource) return CFrame.new(BufferReadI8(SourceBuffer,CurrentOffset), BufferReadI8(SourceBuffer,CurrentOffset+1), BufferReadI8(SourceBuffer,CurrentOffset+2)), CurrentOffset + 3 end
-	StaticTypeHandlers[DATA_TYPE_CF_IDENTITY_INT16] = function(SourceBuffer, CurrentOffset, InstanceSource) return CFrame.new(BufferReadI16(SourceBuffer,CurrentOffset), BufferReadI16(SourceBuffer,CurrentOffset+2), BufferReadI16(SourceBuffer,CurrentOffset+4)), CurrentOffset + 6 end
-	StaticTypeHandlers[DATA_TYPE_CF_IDENTITY_F32] = function(SourceBuffer, CurrentOffset, InstanceSource) return CFrame.new(BufferReadF32(SourceBuffer,CurrentOffset), BufferReadF32(SourceBuffer,CurrentOffset+4), BufferReadF32(SourceBuffer,CurrentOffset+8)), CurrentOffset + 12 end
-
-	StaticTypeHandlers[DATA_TYPE_CF_ROTATION_INT8] = function(SourceBuffer, CurrentOffset, InstanceSource) 
-		local PositionX, PositionY, PositionZ = BufferReadI8(SourceBuffer, CurrentOffset), BufferReadI8(SourceBuffer, CurrentOffset+1), BufferReadI8(SourceBuffer, CurrentOffset+2)
-		local EulerAngleX, EulerAngleY, EulerAngleZ = BufferReadU16(SourceBuffer, CurrentOffset+3) / 10430.2191955, BufferReadU16(SourceBuffer, CurrentOffset+5) / 10430.2191955, BufferReadU16(SourceBuffer, CurrentOffset+7) / 10430.2191955
-		return CFrame.fromEulerAnglesXYZ(EulerAngleX, EulerAngleY, EulerAngleZ) + Vector3.new(PositionX, PositionY, PositionZ), CurrentOffset + 9
-	end
-
-	StaticTypeHandlers[DATA_TYPE_CF_ROTATION_F32] = function(SourceBuffer, CurrentOffset, InstanceSource)
-		local PositionX, PositionY, PositionZ = BufferReadF32(SourceBuffer, CurrentOffset), BufferReadF32(SourceBuffer, CurrentOffset+4), BufferReadF32(SourceBuffer, CurrentOffset+8)
-		local EulerAngleX, EulerAngleY, EulerAngleZ = BufferReadU16(SourceBuffer, CurrentOffset+12) / 10430.2191955, BufferReadU16(SourceBuffer, CurrentOffset+14) / 10430.2191955, BufferReadU16(SourceBuffer, CurrentOffset+16) / 10430.2191955
-		return CFrame.fromEulerAnglesXYZ(EulerAngleX, EulerAngleY, EulerAngleZ) + Vector3.new(PositionX, PositionY, PositionZ), CurrentOffset + 18
-	end
-
-	StaticTypeHandlers[DATA_TYPE_ARRAY_LONG] = function(SourceBuffer, CurrentOffset, InstanceSource: {Instance}?) return ReadArray(SourceBuffer, CurrentOffset + 2, InstanceSource, BufferReadU16(SourceBuffer, CurrentOffset)) end
-	StaticTypeHandlers[DATA_TYPE_MAP_LONG] = function(SourceBuffer, CurrentOffset, InstanceSource: {Instance}?) return ReadMap(SourceBuffer, CurrentOffset + 2, InstanceSource, BufferReadU16(SourceBuffer, CurrentOffset)) end
-
-	ReadAny = function(SourceBuffer: buffer, CurrentOffset: number, InstanceSource: {Instance}?) : (any, number)
-		local DataTypeId = BufferReadU8(SourceBuffer, CurrentOffset)
-		CurrentOffset += 1
-
-		if DataTypeId >= 128 then
-			local StringLength = DataTypeId - 128
-			return BufferReadString(SourceBuffer, CurrentOffset, StringLength), CurrentOffset + StringLength
-		elseif DataTypeId >= 64 then
-			local ElementCount = DataTypeId - 64
-			return ReadMap(SourceBuffer, CurrentOffset, InstanceSource, ElementCount)
-		elseif DataTypeId >= 32 then
-			local ElementCount = DataTypeId - 32
-			return ReadArray(SourceBuffer, CurrentOffset, InstanceSource, ElementCount)
-		else
-			local TypeHandler = StaticTypeHandlers[DataTypeId]
-			if TypeHandler then return TypeHandler(SourceBuffer, CurrentOffset, InstanceSource)
-			else error("Ion: Unknown Any Type ID: " .. tostring(DataTypeId)) end
-		end
-	end
-
-	DataTypes.Any = {
-		IsDynamic = true, ContainsInstances = true,
-		GetByteSize = GetAnyByteSize, Write = WriteAny, Read = ReadAny
-	} :: TypeSerializer<any>
+	return Limiter
 end
 
-type RateLimitInfo = { LastCheck : number, Count : number }
-
-local RegistryWriters : { [number] : {(TargetBuffer : buffer, CurrentOffset : number, ValueToWrite : any, InstanceAccumulator : {Instance}?, InstanceLookup : {[Instance] : number}?) -> number} } = {}
-local RegistryReaders : { [number] : {(SourceBuffer : buffer, CurrentOffset : number, InstanceSource : {Instance}?) -> (any, number)} } = {}
-local RegistrySizers : { [number] : {(ValueToCheck : any) -> number} } = {}
-
-local ListenerCallbackRegistry : { [number] : (...any) -> () } = {}
-local RateLimitRegistry : { [number] : number } = {}
-local RateLimitTrackerRegistry : { [number] : { [Player] : RateLimitInfo } } = {}
-local PacketIdentifierCounter = 0
-
-if IsServerEnvironment then
-	Players.PlayerRemoving:Connect(function(PlayerToRemove : Player)
-		for _, TrackerTable in pairs(RateLimitTrackerRegistry) do TrackerTable[PlayerToRemove] = nil end
-	end)
+local function CheckGlobalRateLimit(Player : Player) : boolean
+	if not GlobalLimitSettings then return true end
+	local Limiter : RateLimit = GlobalRateLimitPerPlayer[Player]
+	if not Limiter then
+		Limiter = { Tokens = GlobalLimitSettings, LastUpdate = os.clock(), RefillRate = GlobalLimitSettings, Capacity = GlobalLimitSettings * 1.5 }
+		GlobalRateLimitPerPlayer[Player] = Limiter
+	end
+	
+	local Now : number = os.clock()
+	local Delta : number = Now - Limiter.LastUpdate
+	Limiter.LastUpdate = Now
+	Limiter.Tokens = math.min(Limiter.Capacity, Limiter.Tokens + (Delta * Limiter.RefillRate))
+	
+	if Limiter.Tokens >= 1 then
+		Limiter.Tokens -= 1
+		return true
+	end
+	return false
 end
 
-local IonLibrary = {}
-IonLibrary.Types = DataTypes
+Players.PlayerRemoving:Connect(function(Player : Player)
+	for _, Cache in pairs(RateLimiters) do Cache[Player] = nil end
+	GlobalRateLimitPerPlayer[Player] = nil
+end)
 
-function IonLibrary.Define(SchemaDefinitions : {TypeSerializer}, Options : PacketOptions?) : any
-	PacketIdentifierCounter += 1
-	local UniquePacketIdentifier = PacketIdentifierCounter
+local Ion = {}
+Ion.Types = DataTypes
 
-	local PacketWriters = {}
-	local PacketReaders = {}
-	local PacketSizers = {}
+function Ion.GetStats() : Stats return GlobalStats end
 
-	local IsSchemaDynamic = false
-	local RequiresInstanceAccumulator = false
-	local BasePacketSize = 0
+function Ion.SetGlobalRateLimit(LimitPerSecond : number)
+	GlobalLimitSettings = LimitPerSecond
+end
 
-	for Index, TypeDefinition in ipairs(SchemaDefinitions) do
-		PacketWriters[Index] = TypeDefinition.Write
-		PacketReaders[Index] = TypeDefinition.Read
-		PacketSizers[Index] = TypeDefinition.GetByteSize
-
-		if TypeDefinition.ContainsInstances then RequiresInstanceAccumulator = true end
-		if TypeDefinition.IsDynamic then IsSchemaDynamic = true else BasePacketSize += TypeDefinition.GetByteSize(nil :: any) end
-	end
-
-	RegistryWriters[UniquePacketIdentifier] = PacketWriters
-	RegistryReaders[UniquePacketIdentifier] = PacketReaders
-	RegistrySizers[UniquePacketIdentifier] = PacketSizers
-
-	local IsUnreliable = if Options and Options.Unreliable then true else false
-	local RateLimit = if Options then Options.RateLimit else nil
-	local IsDedicated = if Options and Options.Dedicated then true else false
-
-	if RateLimit and IsServerEnvironment then
-		RateLimitRegistry[UniquePacketIdentifier] = RateLimit
-		RateLimitTrackerRegistry[UniquePacketIdentifier] = {}
-	end
-
-	local ActiveRemoteChannel
-	if IsDedicated then
-		ActiveRemoteChannel = GetRemoteEvent("Ion_" .. UniquePacketIdentifier, IsUnreliable)
+function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Options : { Unreliable : boolean?, RateLimit : number?, Compress : boolean?, Middleware : Middleware? }?)
+	local Hash : number = 0
+	for Index = 1, #Namespace do Hash = (Hash * 31 + string.byte(Namespace, Index)) % 256 end
+	
+	if Definitions[Hash] then error("Ion: Namespace collision for '" .. Namespace .. "'") end
+	Definitions[Hash] = Schema
+	
+	local IsUnreliable : boolean = Options and Options.Unreliable or false
+	local Rate : number? = Options and Options.RateLimit
+	local UseCompression : boolean = Options and Options.Compress or false
+	local Hooks : Middleware? = Options and Options.Middleware
+	
+	local RemoteName : string = "Ion_" .. Hash
+	
+	if RunService:IsServer() then
+		local Remote : Instance
+		if IsUnreliable then Remote = Instance.new("UnreliableRemoteEvent") else Remote = Instance.new("RemoteEvent") end
+		Remote.Name = RemoteName
+		Remote.Parent = ReplicatedStorage
+		RemoteCache[Hash] = Remote :: any
+		
+		local function OnServerEvent(Player : Player, Data : buffer, Instances : { Instance })
+			if not CheckGlobalRateLimit(Player) then return end
+			
+			if Rate then
+				local Limiter : RateLimit = GetRateLimiter(Hash, Player, Rate)
+				local Now : number = os.clock()
+				local Delta : number = Now - Limiter.LastUpdate
+				Limiter.LastUpdate = Now
+				Limiter.Tokens = math.min(Limiter.Capacity, Limiter.Tokens + (Delta * Limiter.RefillRate))
+				if Limiter.Tokens >= 1 then Limiter.Tokens -= 1 else return end
+			end
+			
+			local Length : number = BufferLen(Data)
+			GlobalStats.TotalBytesReceived += Length
+			GlobalStats.PacketsReceived += 1
+			
+			if UseCompression then
+				local Base64Data : buffer = Data
+				local Compressed : buffer = EncodingService:Base64Decode(Base64Data)
+				Data = EncodingService:DecompressBuffer(Compressed, Enum.CompressionAlgorithm.Zstd)
+			end
+			
+			local Callback = Listeners[Hash]
+			if Callback then
+				local Args : { any } = {}
+				local CursorPosition : number = 0
+				CheckBounds(Data, CursorPosition, 2)
+				local Version : number = BufferReadU8(Data, CursorPosition)
+				local PacketId : number = BufferReadU8(Data, CursorPosition + 1)
+				CursorPosition += 2
+				
+				if Version ~= IonVersion or PacketId ~= Hash then return end
+				for Index, Serializer : TypeSerializer<any> in ipairs(Schema) do
+					local Value : any
+					Value, CursorPosition = Serializer.Read(Data, CursorPosition, Instances)
+					table.insert(Args, Value)
+				end
+				
+				if Hooks and Hooks.OnAfterReceived then Hooks.OnAfterReceived(Player, table.unpack(Args)) end
+				Callback(Player, table.unpack(Args))
+			end
+		end
+		
+		if IsUnreliable then (Remote :: UnreliableRemoteEvent).OnServerEvent:Connect(OnServerEvent)
+		else (Remote :: RemoteEvent).OnServerEvent:Connect(OnServerEvent) end
 	else
-		ActiveRemoteChannel = if IsUnreliable then MainUnreliableRemote else MainReliableRemote
-	end
+		local Remote : Instance = ReplicatedStorage:WaitForChild(RemoteName)
+		RemoteCache[Hash] = Remote :: any
+		
+		local function OnClientEvent(Data : buffer, Instances : { Instance })
+			local Length : number = BufferLen(Data)
+			GlobalStats.TotalBytesReceived += Length
+			GlobalStats.PacketsReceived += 1
+			
+			if UseCompression then
+				local Base64Data : buffer = Data
+				local Compressed : buffer = EncodingService:Base64Decode(Base64Data)
+				Data = EncodingService:DecompressBuffer(Compressed, Enum.CompressionAlgorithm.Zstd)
+			end
 
-	local HeaderSize = if IsDedicated then 0 else 1
-	BasePacketSize += HeaderSize
-
-	local StaticBufferSize = if not IsSchemaDynamic then BasePacketSize else 0
-	local SchemaCount = #SchemaDefinitions
-
-	local function SerializeArguments(ArgumentList : {any}) : (buffer, {Instance}?)
-		local InstanceAccumulator
-		local InstanceLookup
-
-		if RequiresInstanceAccumulator then
-			table.clear(SharedInstanceAccumulator)
-			table.clear(SharedInstanceLookupTable)
-			InstanceAccumulator = SharedInstanceAccumulator
-			InstanceLookup = SharedInstanceLookupTable
-		end
-
-		local AllocationSize = StaticBufferSize
-		if IsSchemaDynamic then
-			AllocationSize = BasePacketSize
-			for Index = 1, SchemaCount do
-				AllocationSize += PacketSizers[Index](ArgumentList[Index])
+			local Callback = Listeners[Hash]
+			if Callback then
+				local Args : { any } = {}
+				local CursorPosition : number = 0
+				CheckBounds(Data, CursorPosition, 2)
+				local Version : number = BufferReadU8(Data, CursorPosition)
+				local PacketId : number = BufferReadU8(Data, CursorPosition + 1)
+				CursorPosition += 2
+				
+				if Version ~= IonVersion or PacketId ~= Hash then return end
+				for Index, Serializer : TypeSerializer<any> in ipairs(Schema) do
+					local Value : any
+					Value, CursorPosition = Serializer.Read(Data, CursorPosition, Instances)
+					table.insert(Args, Value)
+				end
+				
+				if Hooks and Hooks.OnAfterReceived then Hooks.OnAfterReceived(table.unpack(Args)) end
+				Callback(table.unpack(Args))
 			end
 		end
-
-		local PayloadBuffer = BufferCreate(AllocationSize)
-		local WriteOffset = 0
-
-		if not IsDedicated then
-			BufferWriteU8(PayloadBuffer, 0, UniquePacketIdentifier)
-			WriteOffset = 1
-		end
-
-		for Index = 1, SchemaCount do
-			WriteOffset = PacketWriters[Index](PayloadBuffer, WriteOffset, ArgumentList[Index], InstanceAccumulator, InstanceLookup)
-		end
-
-		return PayloadBuffer, InstanceAccumulator
+		
+		if IsUnreliable then (Remote :: UnreliableRemoteEvent).OnClientEvent:Connect(OnClientEvent)
+		else (Remote :: RemoteEvent).OnClientEvent:Connect(OnClientEvent) end
 	end
-
+	
 	local PacketObject = {}
-
-	function PacketObject.Listen(CallbackFunction : (...any) -> ())
-		ListenerCallbackRegistry[UniquePacketIdentifier] = CallbackFunction
-
-		if IsDedicated then
-			local function DedicatedHandler(SenderPlayer : Player?, PayloadBuffer : buffer, InstanceSource : {Instance}?)
-				if not IsServerEnvironment then SenderPlayer = nil end
-
-				if IsServerEnvironment and SenderPlayer and RateLimit then
-					local TrackerTable = RateLimitTrackerRegistry[UniquePacketIdentifier]
-					local PlayerRateInfo = TrackerTable[SenderPlayer]
-					local CurrentTime = os.clock()
-					if not PlayerRateInfo then PlayerRateInfo = { LastCheck = CurrentTime, Count = 0 }; TrackerTable[SenderPlayer] = PlayerRateInfo end
-					if CurrentTime - PlayerRateInfo.LastCheck >= 1 then PlayerRateInfo.Count = 0; PlayerRateInfo.LastCheck = CurrentTime end
-					PlayerRateInfo.Count += 1
-					if PlayerRateInfo.Count > RateLimit then return end
-				end
-
-				local ReadOffset = 0
-				local ArgumentCount = #PacketReaders
-
-				if ArgumentCount == 1 then
-					local Val1; Val1, ReadOffset = PacketReaders[1](PayloadBuffer, ReadOffset, InstanceSource)
-					if IsServerEnvironment then CallbackFunction(SenderPlayer, Val1) else CallbackFunction(Val1) end
-				elseif ArgumentCount == 2 then
-					local Val1, Val2; 
-					Val1, ReadOffset = PacketReaders[1](PayloadBuffer, ReadOffset, InstanceSource)
-					Val2, ReadOffset = PacketReaders[2](PayloadBuffer, ReadOffset, InstanceSource)
-					if IsServerEnvironment then CallbackFunction(SenderPlayer, Val1, Val2) else CallbackFunction(Val1, Val2) end
-				elseif ArgumentCount == 3 then
-					local Val1, Val2, Val3;
-					Val1, ReadOffset = PacketReaders[1](PayloadBuffer, ReadOffset, InstanceSource)
-					Val2, ReadOffset = PacketReaders[2](PayloadBuffer, ReadOffset, InstanceSource)
-					Val3, ReadOffset = PacketReaders[3](PayloadBuffer, ReadOffset, InstanceSource)
-					if IsServerEnvironment then CallbackFunction(SenderPlayer, Val1, Val2, Val3) else CallbackFunction(Val1, Val2, Val3) end
-				elseif ArgumentCount <= 8 then
-					local Argument1, Argument2, Argument3, Argument4, Argument5, Argument6, Argument7, Argument8
-					if ArgumentCount >= 1 then Argument1, ReadOffset = PacketReaders[1](PayloadBuffer, ReadOffset, InstanceSource) end
-					if ArgumentCount >= 2 then Argument2, ReadOffset = PacketReaders[2](PayloadBuffer, ReadOffset, InstanceSource) end
-					if ArgumentCount >= 3 then Argument3, ReadOffset = PacketReaders[3](PayloadBuffer, ReadOffset, InstanceSource) end
-					if ArgumentCount >= 4 then Argument4, ReadOffset = PacketReaders[4](PayloadBuffer, ReadOffset, InstanceSource) end
-					if ArgumentCount >= 5 then Argument5, ReadOffset = PacketReaders[5](PayloadBuffer, ReadOffset, InstanceSource) end
-					if ArgumentCount >= 6 then Argument6, ReadOffset = PacketReaders[6](PayloadBuffer, ReadOffset, InstanceSource) end
-					if ArgumentCount >= 7 then Argument7, ReadOffset = PacketReaders[7](PayloadBuffer, ReadOffset, InstanceSource) end
-					if ArgumentCount >= 8 then Argument8, ReadOffset = PacketReaders[8](PayloadBuffer, ReadOffset, InstanceSource) end
-
-					if IsServerEnvironment then
-						CallbackFunction(SenderPlayer, Argument1, Argument2, Argument3, Argument4, Argument5, Argument6, Argument7, Argument8)
-					else
-						CallbackFunction(Argument1, Argument2, Argument3, Argument4, Argument5, Argument6, Argument7, Argument8)
-					end
-				else
-					local ArgumentsTable = table.create(ArgumentCount)
-					for Index = 1, ArgumentCount do ArgumentsTable[Index], ReadOffset = PacketReaders[Index](PayloadBuffer, ReadOffset, InstanceSource) end
-
-					if IsServerEnvironment then
-						CallbackFunction(SenderPlayer, table.unpack(ArgumentsTable))
-					else
-						CallbackFunction(table.unpack(ArgumentsTable))
-					end
-				end
-			end
-
-			if IsServerEnvironment then
-				(ActiveRemoteChannel :: RemoteEvent).OnServerEvent:Connect(DedicatedHandler)
-			else
-				(ActiveRemoteChannel :: RemoteEvent).OnClientEvent:Connect(function(ReceivedBuffer, ReceivedInstances) DedicatedHandler(nil, ReceivedBuffer, ReceivedInstances) end)
-			end
+	
+	function PacketObject.Send(Target : Player?, ... : any)
+		if Hooks and Hooks.OnBeforeSend then
+			if not Hooks.OnBeforeSend(...) then return end
 		end
-	end
-
-	if IsServerEnvironment then
-		function PacketObject.Send() error("Ion: Server must use SendTo/SendToAll/SendToList") end
-		function PacketObject.SendTo(RecipientPlayer : Player, ...)
-			local PayloadBuffer, InstanceList = SerializeArguments({...})
-			local RemoteObject = ActiveRemoteChannel :: RemoteEvent
-			if InstanceList and #InstanceList > 0 then
-				if IsUnreliable then (RemoteObject :: any):FireClient(RecipientPlayer, PayloadBuffer, InstanceList)
-				else RemoteObject:FireClient(RecipientPlayer, PayloadBuffer, InstanceList) end
-			else
-				if IsUnreliable then (RemoteObject :: any):FireClient(RecipientPlayer, PayloadBuffer)
-				else RemoteObject:FireClient(RecipientPlayer, PayloadBuffer) end
-			end
+		
+		local Args : { any } = { ... }
+		local TargetBuffer : buffer = AcquireBuffer(1024)
+		local CursorPosition : number = 0
+		local InstanceAccumulator : { Instance } = {}
+		local InstanceLookup : { [Instance] : number } = {}
+		
+		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 2)
+		BufferWriteU8(TargetBuffer, CursorPosition, IonVersion)
+		BufferWriteU8(TargetBuffer, CursorPosition + 1, Hash)
+		CursorPosition += 2
+		
+		for Index, Serializer : TypeSerializer<any> in ipairs(Schema) do
+			CursorPosition = Serializer.Write(TargetBuffer, CursorPosition, Args[Index], InstanceAccumulator, InstanceLookup)
 		end
-		function PacketObject.SendToAll(...)
-			local PayloadBuffer, InstanceList = SerializeArguments({...})
-			local RemoteObject = ActiveRemoteChannel :: RemoteEvent
-			if InstanceList and #InstanceList > 0 then
-				if IsUnreliable then (RemoteObject :: any):FireAllClients(PayloadBuffer, InstanceList)
-				else RemoteObject:FireAllClients(PayloadBuffer, InstanceList) end
-			else
-				if IsUnreliable then (RemoteObject :: any):FireAllClients(PayloadBuffer)
-				else RemoteObject:FireAllClients(PayloadBuffer) end
-			end
+		
+		local FinalBuffer : buffer = BufferCreate(CursorPosition)
+		BufferCopy(FinalBuffer, 0, TargetBuffer, 0, CursorPosition)
+		ReleaseBuffer(TargetBuffer)
+		
+		if UseCompression then
+			local Compressed : buffer = EncodingService:CompressBuffer(FinalBuffer, Enum.CompressionAlgorithm.Zstd)
+			FinalBuffer = EncodingService:Base64Encode(Compressed)
 		end
-		function PacketObject.SendToList(RecipientPlayers : {Player}, ...)
-			local PayloadBuffer, InstanceList = SerializeArguments({...})
-			local RemoteObject = ActiveRemoteChannel :: RemoteEvent
-			local HasInstances = InstanceList and #InstanceList > 0
-
-			if IsUnreliable then
-				local UnreliableObject = RemoteObject :: any
-				if HasInstances then for _, RecipientPlayer in ipairs(RecipientPlayers) do UnreliableObject:FireClient(RecipientPlayer, PayloadBuffer, InstanceList) end
-				else for _, RecipientPlayer in ipairs(RecipientPlayers) do UnreliableObject:FireClient(RecipientPlayer, PayloadBuffer) end end
-			else
-				if HasInstances then for _, RecipientPlayer in ipairs(RecipientPlayers) do RemoteObject:FireClient(RecipientPlayer, PayloadBuffer, InstanceList) end
-				else for _, RecipientPlayer in ipairs(RecipientPlayers) do RemoteObject:FireClient(RecipientPlayer, PayloadBuffer) end end
-			end
-		end
-	else
-		function PacketObject.Send(...)
-			local PayloadBuffer, InstanceList = SerializeArguments({...})
-			local RemoteObject = ActiveRemoteChannel :: RemoteEvent
-			if InstanceList and #InstanceList > 0 then
-				if IsUnreliable then (RemoteObject :: any):FireServer(PayloadBuffer, InstanceList)
-				else RemoteObject:FireServer(PayloadBuffer, InstanceList) end
-			else
-				if IsUnreliable then (RemoteObject :: any):FireServer(PayloadBuffer)
-				else RemoteObject:FireServer(PayloadBuffer) end
-			end
-		end
-		function PacketObject.SendTo() error("Ion: Client cannot use SendTo") end
-		function PacketObject.SendToAll() error("Ion: Client cannot use SendToAll") end
-		function PacketObject.SendToList() error("Ion: Client cannot use SendToList") end
-	end
-
-	(PacketObject :: any).Client = PacketObject;
-	(PacketObject :: any).Server = PacketObject;
-
-	return table.freeze(PacketObject)
-end
-
-local function HandleNetworkEvent(SenderPlayer : Player?, PayloadBuffer : buffer, InstanceSource : {Instance}?)
-	if BufferLen(PayloadBuffer) < 1 then return end
-	local PacketIdentifier = BufferReadU8(PayloadBuffer, 0)
-
-	local PacketReaders = RegistryReaders[PacketIdentifier]
-	local CallbackFunction = ListenerCallbackRegistry[PacketIdentifier]
-	if not PacketReaders or not CallbackFunction then return end
-
-	if IsServerEnvironment and SenderPlayer then
-		local Limit = RateLimitRegistry[PacketIdentifier]
-		if Limit then
-			local TrackerTable = RateLimitTrackerRegistry[PacketIdentifier]
-			local PlayerRateInfo = TrackerTable[SenderPlayer]
-			local CurrentTime = os.clock()
-			if not PlayerRateInfo then PlayerRateInfo = { LastCheck = CurrentTime, Count = 0 }; TrackerTable[SenderPlayer] = PlayerRateInfo end
-			if CurrentTime - PlayerRateInfo.LastCheck >= 1 then PlayerRateInfo.Count = 0; PlayerRateInfo.LastCheck = CurrentTime end
-			PlayerRateInfo.Count += 1
-			if PlayerRateInfo.Count > Limit then return end
-		end
-	end
-
-	local ReadOffset = 1
-	local ArgumentCount = #PacketReaders
-
-	if ArgumentCount == 1 then
-		local Val1; Val1, ReadOffset = PacketReaders[1](PayloadBuffer, ReadOffset, InstanceSource)
-		if IsServerEnvironment then CallbackFunction(SenderPlayer, Val1) else CallbackFunction(Val1) end
-	elseif ArgumentCount == 2 then
-		local Val1, Val2; 
-		Val1, ReadOffset = PacketReaders[1](PayloadBuffer, ReadOffset, InstanceSource)
-		Val2, ReadOffset = PacketReaders[2](PayloadBuffer, ReadOffset, InstanceSource)
-		if IsServerEnvironment then CallbackFunction(SenderPlayer, Val1, Val2) else CallbackFunction(Val1, Val2) end
-	elseif ArgumentCount == 3 then
-		local Val1, Val2, Val3;
-		Val1, ReadOffset = PacketReaders[1](PayloadBuffer, ReadOffset, InstanceSource)
-		Val2, ReadOffset = PacketReaders[2](PayloadBuffer, ReadOffset, InstanceSource)
-		Val3, ReadOffset = PacketReaders[3](PayloadBuffer, ReadOffset, InstanceSource)
-		if IsServerEnvironment then CallbackFunction(SenderPlayer, Val1, Val2, Val3) else CallbackFunction(Val1, Val2, Val3) end
-	elseif ArgumentCount <= 8 then
-		local Argument1, Argument2, Argument3, Argument4, Argument5, Argument6, Argument7, Argument8
-		if ArgumentCount >= 1 then Argument1, ReadOffset = PacketReaders[1](PayloadBuffer, ReadOffset, InstanceSource) end
-		if ArgumentCount >= 2 then Argument2, ReadOffset = PacketReaders[2](PayloadBuffer, ReadOffset, InstanceSource) end
-		if ArgumentCount >= 3 then Argument3, ReadOffset = PacketReaders[3](PayloadBuffer, ReadOffset, InstanceSource) end
-		if ArgumentCount >= 4 then Argument4, ReadOffset = PacketReaders[4](PayloadBuffer, ReadOffset, InstanceSource) end
-		if ArgumentCount >= 5 then Argument5, ReadOffset = PacketReaders[5](PayloadBuffer, ReadOffset, InstanceSource) end
-		if ArgumentCount >= 6 then Argument6, ReadOffset = PacketReaders[6](PayloadBuffer, ReadOffset, InstanceSource) end
-		if ArgumentCount >= 7 then Argument7, ReadOffset = PacketReaders[7](PayloadBuffer, ReadOffset, InstanceSource) end
-		if ArgumentCount >= 8 then Argument8, ReadOffset = PacketReaders[8](PayloadBuffer, ReadOffset, InstanceSource) end
-
-		if IsServerEnvironment then
-			CallbackFunction(SenderPlayer, Argument1, Argument2, Argument3, Argument4, Argument5, Argument6, Argument7, Argument8)
+		
+		local Size : number = BufferLen(FinalBuffer)
+		if IsUnreliable and Size > MaxPacketSize then warn("Ion: Unreliable packet too large"); return end
+		
+		GlobalStats.TotalBytesSent += Size
+		GlobalStats.PacketsSent += 1
+		
+		local Remote : any = RemoteCache[Hash]
+		if RunService:IsServer() then
+			if Target then Remote:FireClient(Target, FinalBuffer, InstanceAccumulator)
+			else Remote:FireAllClients(FinalBuffer, InstanceAccumulator) end
 		else
-			CallbackFunction(Argument1, Argument2, Argument3, Argument4, Argument5, Argument6, Argument7, Argument8)
-		end
-	else
-		local ArgumentsTable = table.create(ArgumentCount)
-		for Index = 1, ArgumentCount do
-			local DecodedValue
-			DecodedValue, ReadOffset = PacketReaders[Index](PayloadBuffer, ReadOffset, InstanceSource)
-			ArgumentsTable[Index] = DecodedValue
-		end
-
-		if IsServerEnvironment then
-			CallbackFunction(SenderPlayer, table.unpack(ArgumentsTable))
-		else
-			CallbackFunction(table.unpack(ArgumentsTable))
+			Remote:FireServer(FinalBuffer, InstanceAccumulator)
 		end
 	end
+	
+	function PacketObject.Listen(Callback : (...any) -> ())
+		Listeners[Hash] = Callback
+	end
+	
+	function PacketObject.Destroy()
+		Listeners[Hash] = nil
+		local Remote : any = RemoteCache[Hash]
+		if Remote then
+			Remote:Destroy()
+			RemoteCache[Hash] = nil
+		end
+		Definitions[Hash] = nil
+	end
+	
+	local ServerInterface = {}
+	local ClientInterface = {}
+	
+	function ServerInterface.SendTo(Recipient : Player, ... : any) PacketObject.Send(Recipient, ...) end
+	function ServerInterface.SendToAll(... : any) PacketObject.Send(nil, ...) end
+	function ServerInterface.SendToList(Recipients : { Player }, ... : any) for _, Player in ipairs(Recipients) do PacketObject.Send(Player, ...) end end
+	function ServerInterface.Listen(Callback : (Player, ...any) -> ()) PacketObject.Listen(Callback) end
+	
+	function ClientInterface.Send(... : any) PacketObject.Send(nil, ...) end
+	function ClientInterface.Listen(Callback : (...any) -> ()) PacketObject.Listen(Callback) end
+	
+	return {
+		Server = ServerInterface,
+		Client = ClientInterface
+	} :: IonPacket<any>
 end
 
-if IsServerEnvironment then
-	MainReliableRemote.OnServerEvent:Connect(HandleNetworkEvent)
-	MainUnreliableRemote.OnServerEvent:Connect(HandleNetworkEvent)
-else
-	MainReliableRemote.OnClientEvent:Connect(function(ReceivedBuffer, ReceivedInstances) HandleNetworkEvent(nil, ReceivedBuffer, ReceivedInstances) end)
-	MainUnreliableRemote.OnClientEvent:Connect(function(ReceivedBuffer, ReceivedInstances) HandleNetworkEvent(nil, ReceivedBuffer, ReceivedInstances) end)
-end
-
-return table.freeze(IonLibrary)
+return Ion
