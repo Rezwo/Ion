@@ -101,7 +101,8 @@ local function WriteFloat16(TargetBuffer : buffer, CursorPosition : number, Valu
 		elseif Exponent >= 32 then
 			Encoded = Sign + 0x7C00
 		else
-			Encoded = Sign + Bit32LShift(Exponent, 10) + MathFloor(Mantissa * 1024 + 0.5) % 1024
+			local Fractional : number = Mantissa * 2 - 1
+			Encoded = Sign + Bit32LShift(Exponent, 10) + MathFloor(Fractional * 1024 + 0.5)
 		end
 	end
 	BufferWriteU16(TargetBuffer, CursorPosition, Encoded)
@@ -466,12 +467,15 @@ DataTypes.CFrame = {
 		local PosY : number = Value.Y
 		local PosZ : number = Value.Z
 		local Axis : Vector3, Angle : number = Value:ToAxisAngle()
+
+		local RotVec : Vector3 = Axis * Angle
+
 		BufferWriteF32(TargetBuffer, CursorPosition, PosX)
 		BufferWriteF32(TargetBuffer, CursorPosition + 4, PosY)
 		BufferWriteF32(TargetBuffer, CursorPosition + 8, PosZ)
-		BufferWriteF32(TargetBuffer, CursorPosition + 12, Axis.X)
-		BufferWriteF32(TargetBuffer, CursorPosition + 16, Axis.Y)
-		BufferWriteF32(TargetBuffer, CursorPosition + 20, Axis.Z)
+		BufferWriteF32(TargetBuffer, CursorPosition + 12, RotVec.X)
+		BufferWriteF32(TargetBuffer, CursorPosition + 16, RotVec.Y)
+		BufferWriteF32(TargetBuffer, CursorPosition + 20, RotVec.Z)
 		return CursorPosition + 24
 	end,
 	Read = function(TargetBuffer : buffer, CursorPosition : number)
@@ -479,13 +483,18 @@ DataTypes.CFrame = {
 		local PosX : number = BufferReadF32(TargetBuffer, CursorPosition)
 		local PosY : number = BufferReadF32(TargetBuffer, CursorPosition + 4)
 		local PosZ : number = BufferReadF32(TargetBuffer, CursorPosition + 8)
-		local AxisX : number = BufferReadF32(TargetBuffer, CursorPosition + 12)
-		local AxisY : number = BufferReadF32(TargetBuffer, CursorPosition + 16)
-		local AxisZ : number = BufferReadF32(TargetBuffer, CursorPosition + 20)
+		local RotX : number = BufferReadF32(TargetBuffer, CursorPosition + 12)
+		local RotY : number = BufferReadF32(TargetBuffer, CursorPosition + 16)
+		local RotZ : number = BufferReadF32(TargetBuffer, CursorPosition + 20)
+
 		local PosV : Vector3 = Vector3.new(PosX, PosY, PosZ)
-		local Axis : Vector3 = Vector3.new(AxisX, AxisY, AxisZ)
-		if Axis.Magnitude < 0.001 then return CFrame.new(PosV), CursorPosition + 24 end
-		return CFrame.fromAxisAngle(Axis, Axis.Magnitude) + PosV, CursorPosition + 24
+		local RotVec : Vector3 = Vector3.new(RotX, RotY, RotZ)
+		local Angle : number = RotVec.Magnitude
+
+		if Angle < 0.001 then return CFrame.new(PosV), CursorPosition + 24 end
+
+		local Axis : Vector3 = RotVec / Angle
+		return CFrame.fromAxisAngle(Axis, Angle) + PosV, CursorPosition + 24
 	end
 } :: TypeSerializer<CFrame>
 
@@ -513,10 +522,12 @@ DataTypes.CFrameFloat16 = {
 		WriteFloat16(TargetBuffer, CursorPosition, Value.X)
 		WriteFloat16(TargetBuffer, CursorPosition + 2, Value.Y)
 		WriteFloat16(TargetBuffer, CursorPosition + 4, Value.Z)
+
 		local EulerX : number, EulerY : number, EulerZ : number = Value:ToEulerAnglesXYZ()
-		BufferWriteU16(TargetBuffer, CursorPosition + 6, EulerX * 10430.2191955 + 0.5)
-		BufferWriteU16(TargetBuffer, CursorPosition + 8, EulerY * 10430.2191955 + 0.5)
-		BufferWriteU16(TargetBuffer, CursorPosition + 10, EulerZ * 10430.2191955 + 0.5)
+
+		BufferWriteI16(TargetBuffer, CursorPosition + 6, MathRound(EulerX * 10430.2191955))
+		BufferWriteI16(TargetBuffer, CursorPosition + 8, MathRound(EulerY * 10430.2191955))
+		BufferWriteI16(TargetBuffer, CursorPosition + 10, MathRound(EulerZ * 10430.2191955))
 		return CursorPosition + 12
 	end,
 	Read = function(TargetBuffer : buffer, CursorPosition : number)
@@ -524,9 +535,11 @@ DataTypes.CFrameFloat16 = {
 		local PosX : number = ReadFloat16(TargetBuffer, CursorPosition)
 		local PosY : number = ReadFloat16(TargetBuffer, CursorPosition + 2)
 		local PosZ : number = ReadFloat16(TargetBuffer, CursorPosition + 4)
-		local EulerX : number = BufferReadU16(TargetBuffer, CursorPosition + 6) / 10430.2191955
-		local EulerY : number = BufferReadU16(TargetBuffer, CursorPosition + 8) / 10430.2191955
-		local EulerZ : number = BufferReadU16(TargetBuffer, CursorPosition + 10) / 10430.2191955
+
+		local EulerX : number = BufferReadI16(TargetBuffer, CursorPosition + 6) / 10430.2191955
+		local EulerY : number = BufferReadI16(TargetBuffer, CursorPosition + 8) / 10430.2191955
+		local EulerZ : number = BufferReadI16(TargetBuffer, CursorPosition + 10) / 10430.2191955
+
 		return CFrame.fromEulerAnglesXYZ(EulerX, EulerY, EulerZ) + Vector3.new(PosX, PosY, PosZ), CursorPosition + 12
 	end
 } :: TypeSerializer<CFrame>
@@ -539,10 +552,12 @@ DataTypes.CFrameHighPrecision = {
 		BufferWriteF64(TargetBuffer, CursorPosition, Value.X)
 		BufferWriteF64(TargetBuffer, CursorPosition + 8, Value.Y)
 		BufferWriteF64(TargetBuffer, CursorPosition + 16, Value.Z)
+
 		local EulerX : number, EulerY : number, EulerZ : number = Value:ToEulerAnglesXYZ()
-		BufferWriteU16(TargetBuffer, CursorPosition + 24, EulerX * 10430.2191955 + 0.5)
-		BufferWriteU16(TargetBuffer, CursorPosition + 26, EulerY * 10430.2191955 + 0.5)
-		BufferWriteU16(TargetBuffer, CursorPosition + 28, EulerZ * 10430.2191955 + 0.5)
+
+		BufferWriteI16(TargetBuffer, CursorPosition + 24, MathRound(EulerX * 10430.2191955))
+		BufferWriteI16(TargetBuffer, CursorPosition + 26, MathRound(EulerY * 10430.2191955))
+		BufferWriteI16(TargetBuffer, CursorPosition + 28, MathRound(EulerZ * 10430.2191955))
 		return CursorPosition + 30
 	end,
 	Read = function(TargetBuffer : buffer, CursorPosition : number)
@@ -550,9 +565,11 @@ DataTypes.CFrameHighPrecision = {
 		local PosX : number = BufferReadF64(TargetBuffer, CursorPosition)
 		local PosY : number = BufferReadF64(TargetBuffer, CursorPosition + 8)
 		local PosZ : number = BufferReadF64(TargetBuffer, CursorPosition + 16)
-		local EulerX : number = BufferReadU16(TargetBuffer, CursorPosition + 24) / 10430.2191955
-		local EulerY : number = BufferReadU16(TargetBuffer, CursorPosition + 26) / 10430.2191955
-		local EulerZ : number = BufferReadU16(TargetBuffer, CursorPosition + 28) / 10430.2191955
+
+		local EulerX : number = BufferReadI16(TargetBuffer, CursorPosition + 24) / 10430.2191955
+		local EulerY : number = BufferReadI16(TargetBuffer, CursorPosition + 26) / 10430.2191955
+		local EulerZ : number = BufferReadI16(TargetBuffer, CursorPosition + 28) / 10430.2191955
+
 		return CFrame.fromEulerAnglesXYZ(EulerX, EulerY, EulerZ) + Vector3.new(PosX, PosY, PosZ), CursorPosition + 30
 	end
 } :: TypeSerializer<CFrame>
