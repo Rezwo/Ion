@@ -112,12 +112,12 @@ end
 local function WriteFloat16(TargetBuffer : buffer, CursorPosition : number, Value : number)
 	local Sign : number = if Value < 0 then 0x8000 else 0
 	if Value < 0 then Value = -Value end
-	
+
 	local Encoded : number = 0
 	if Value ~= 0 then
 		local Mantissa : number, Exponent : number = MathFrexp(Value)
 		Exponent += 14
-		
+
 		if Exponent <= 0 then
 			if Exponent < -10 then
 				Encoded = Sign
@@ -140,7 +140,7 @@ local function ReadFloat16(SourceBuffer : buffer, CursorPosition : number) : num
 	local Sign : boolean = Bit32BTest(Encoded, 0x8000)
 	local Exponent : number = Bit32RShift(Bit32Band(Encoded, 0x7C00), 10)
 	local Mantissa : number = Bit32Band(Encoded, 0x03FF)
-	
+
 	if Exponent == 0 then
 		if Mantissa == 0 then return 0 end
 		local Result : number = MathLdexp(Mantissa, -24) 
@@ -152,7 +152,7 @@ local function ReadFloat16(SourceBuffer : buffer, CursorPosition : number) : num
 			return 0/0
 		end
 	end
-	
+
 	local Result : number = MathLdexp(Mantissa + 1024, Exponent - 25)
 	return if Sign then -Result else Result
 end
@@ -236,7 +236,7 @@ DataTypes.UInt64 = {
 		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 8)
 		local Upper : number
 		local Lower : number
-		
+
 		if type(Value) == "table" then
 			Upper = Value.Upper or 0
 			Lower = Value.Lower or 0
@@ -249,7 +249,7 @@ DataTypes.UInt64 = {
 			Upper = MathFloor(NumberValue / 4294967296)
 			Lower = NumberValue % 4294967296
 		end
-		
+
 		BufferWriteU32(TargetBuffer, CursorPosition, Upper)
 		BufferWriteU32(TargetBuffer, CursorPosition + 4, Lower)
 		return TargetBuffer, CursorPosition + 8
@@ -311,7 +311,7 @@ DataTypes.Int64 = {
 		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 8)
 		local High : number
 		local Low : number
-		
+
 		if type(Value) == "table" then
 			High = Value.Upper or 0
 			Low = Value.Lower or 0
@@ -320,7 +320,7 @@ DataTypes.Int64 = {
 			High = MathFloor(NumberValue / 4294967296)
 			Low = NumberValue % 4294967296
 		end
-		
+
 		BufferWriteI32(TargetBuffer, CursorPosition, High)
 		BufferWriteU32(TargetBuffer, CursorPosition + 4, Low)
 		return TargetBuffer, CursorPosition + 8
@@ -470,8 +470,8 @@ end
 
 DataTypes.Instance = {
 	IsDynamic = false, ContainsInstances = true,
-	GetByteSize = function(_ : Instance) : number return 2 end,
-	Write = function(TargetBuffer, CursorPosition, Value, InstanceAccumulator, InstanceLookup)
+	GetByteSize = function(_ : Instance?) : number return 2 end,
+	Write = function(TargetBuffer : buffer, CursorPosition : number, Value : Instance?, InstanceAccumulator : { Instance }, InstanceLookup : { [Instance] : number })
 		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 2)
 		if Value and typeof(Value) == "Instance" and Value:IsDescendantOf(game) then
 			local Index : number? = InstanceLookup[Value]
@@ -488,31 +488,33 @@ DataTypes.Instance = {
 		end
 		return TargetBuffer, CursorPosition + 2
 	end,
-	Read = function(TargetBuffer, CursorPosition, InstanceSource)
+	Read = function(TargetBuffer : buffer, CursorPosition : number, InstanceSource : { Instance }) : (Instance?, number)
 		CheckBounds(TargetBuffer, CursorPosition, 2)
 		local Index : number = BufferReadU16(TargetBuffer, CursorPosition)
 		local InstanceObject : Instance? = InstanceSource[Index]
+
 		if Index ~= 0 and not InstanceObject then
 			warn("Ion: Instance reference " .. Index .. " not found in replication")
 			return nil, CursorPosition + 2
 		end
 		return InstanceObject, CursorPosition + 2
 	end
-} :: TypeSerializer<Instance>
+} :: TypeSerializer<Instance?>
 
 function DataTypes.UseEnum(EnumType : any) : TypeSerializer<EnumItem>
 	return {
 		IsDynamic = false, ContainsInstances = false,
 		GetByteSize = function(_ : EnumItem) : number return 2 end,
-		Write = function(TargetBuffer, CursorPosition, Value) 
+		Write = function(TargetBuffer : buffer, CursorPosition : number, Value : EnumItem) 
 			TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 2)
 			BufferWriteU16(TargetBuffer, CursorPosition, Value.Value)
 			return TargetBuffer, CursorPosition + 2 
 		end,
-		Read = function(TargetBuffer, CursorPosition) 
+		Read = function(TargetBuffer : buffer, CursorPosition : number, _InstanceSource : {Instance}) : (EnumItem, number)
 			CheckBounds(TargetBuffer, CursorPosition, 2)
 			local Value : number = BufferReadU16(TargetBuffer, CursorPosition)
-			local EnumItems = EnumType:GetEnumItems()
+			local EnumItems = EnumType:GetEnumItems() :: { EnumItem }
+
 			for _, Item : EnumItem in ipairs(EnumItems) do
 				if Item.Value == Value then return Item, CursorPosition + 2 end
 			end
@@ -579,7 +581,7 @@ DataTypes.CFrame = {
 		local PositionZ : number = Value.Z
 		local Axis : Vector3, Angle : number = Value:ToAxisAngle()
 		local RotationVector : Vector3 = Axis * Angle
-		
+
 		if Angle ~= Angle then RotationVector = Vector3.zero end
 
 		BufferWriteF32(TargetBuffer, CursorPosition, PositionX)
@@ -642,7 +644,7 @@ DataTypes.CFrameFloat16 = {
 DataTypes.Color3 = {
 	IsDynamic = false, ContainsInstances = false,
 	GetByteSize = function(_ : Color3) : number return 3 end,
-	Write = function(TargetBuffer, CursorPosition, Value)
+	Write = function(TargetBuffer, CursorPosition, Value : Color3)
 		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 3)
 		BufferWriteU8(TargetBuffer, CursorPosition, MathClamp(MathRound(Value.R * 255), 0, 255))
 		BufferWriteU8(TargetBuffer, CursorPosition + 1, MathClamp(MathRound(Value.G * 255), 0, 255))
@@ -854,7 +856,7 @@ do
 		else return 1 end
 	end
 
-	local function WriteAny(TargetBuffer, CursorPosition, Value, InstanceAccumulator, InstanceLookup)
+	local function WriteAny(TargetBuffer : buffer, CursorPosition : number, Value : any, InstanceAccumulator : { Instance }, InstanceLookup : { [Instance] : number }) : (buffer, number)
 		local TypeName : string = typeof(Value)
 		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 1)
 
@@ -863,46 +865,46 @@ do
 			return TargetBuffer, CursorPosition + 1
 		elseif TypeName == "string" then 
 			BufferWriteU8(TargetBuffer, CursorPosition, 3)
-			return DataTypes.String.Write(TargetBuffer, CursorPosition + 1, Value, InstanceAccumulator, InstanceLookup)
+			return DataTypes.String.Write(TargetBuffer, CursorPosition + 1, Value :: string, InstanceAccumulator, InstanceLookup)
 		elseif TypeName == "number" then 
 			BufferWriteU8(TargetBuffer, CursorPosition, 2)
-			return DataTypes.Float64.Write(TargetBuffer, CursorPosition + 1, Value, InstanceAccumulator, InstanceLookup)
+			return DataTypes.Float64.Write(TargetBuffer, CursorPosition + 1, Value :: number, InstanceAccumulator, InstanceLookup)
 		elseif TypeName == "boolean" then 
 			BufferWriteU8(TargetBuffer, CursorPosition, 1)
-			return DataTypes.Boolean.Write(TargetBuffer, CursorPosition + 1, Value, InstanceAccumulator, InstanceLookup)
+			return DataTypes.Boolean.Write(TargetBuffer, CursorPosition + 1, Value :: boolean, InstanceAccumulator, InstanceLookup)
 		elseif TypeName == "Instance" then 
 			BufferWriteU8(TargetBuffer, CursorPosition, 4)
-			return DataTypes.Instance.Write(TargetBuffer, CursorPosition + 1, Value, InstanceAccumulator, InstanceLookup)
+			return DataTypes.Instance.Write(TargetBuffer, CursorPosition + 1, Value :: Instance, InstanceAccumulator, InstanceLookup)
 		elseif TypeName == "Vector3" then 
 			BufferWriteU8(TargetBuffer, CursorPosition, 5)
-			return DataTypes.Vector3.Write(TargetBuffer, CursorPosition + 1, Value, InstanceAccumulator, InstanceLookup)
+			return DataTypes.Vector3.Write(TargetBuffer, CursorPosition + 1, Value :: Vector3, InstanceAccumulator, InstanceLookup)
 		elseif TypeName == "CFrame" then 
 			BufferWriteU8(TargetBuffer, CursorPosition, 7)
-			return DataTypes.CFrame.Write(TargetBuffer, CursorPosition + 1, Value, InstanceAccumulator, InstanceLookup)
+			return DataTypes.CFrame.Write(TargetBuffer, CursorPosition + 1, Value :: CFrame, InstanceAccumulator, InstanceLookup)
 		elseif TypeName == "EnumItem" then 
 			BufferWriteU8(TargetBuffer, CursorPosition, 6)
-			return DataTypes.UInt16.Write(TargetBuffer, CursorPosition + 1, Value.Value, InstanceAccumulator, InstanceLookup)
+			return DataTypes.UInt16.Write(TargetBuffer, CursorPosition + 1, (Value :: EnumItem).Value, InstanceAccumulator, InstanceLookup)
 		elseif TypeName == "Vector2" then
 			BufferWriteU8(TargetBuffer, CursorPosition, 8)
-			return DataTypes.Vector2.Write(TargetBuffer, CursorPosition + 1, Value, InstanceAccumulator, InstanceLookup)
+			return DataTypes.Vector2.Write(TargetBuffer, CursorPosition + 1, Value :: Vector2, InstanceAccumulator, InstanceLookup)
 		elseif TypeName == "Color3" then
 			BufferWriteU8(TargetBuffer, CursorPosition, 9)
-			return DataTypes.Color3.Write(TargetBuffer, CursorPosition + 1, Value, InstanceAccumulator, InstanceLookup)
+			return DataTypes.Color3.Write(TargetBuffer, CursorPosition + 1, Value :: Color3, InstanceAccumulator, InstanceLookup)
 		elseif TypeName == "UDim2" then
 			BufferWriteU8(TargetBuffer, CursorPosition, 10)
-			return DataTypes.UDim2.Write(TargetBuffer, CursorPosition + 1, Value, InstanceAccumulator, InstanceLookup)
+			return DataTypes.UDim2.Write(TargetBuffer, CursorPosition + 1, Value :: UDim2, InstanceAccumulator, InstanceLookup)
 		elseif TypeName == "DateTime" then
 			BufferWriteU8(TargetBuffer, CursorPosition, 11)
-			return DataTypes.DateTime.Write(TargetBuffer, CursorPosition + 1, Value, InstanceAccumulator, InstanceLookup)
+			return DataTypes.DateTime.Write(TargetBuffer, CursorPosition + 1, Value :: DateTime, InstanceAccumulator, InstanceLookup)
 		elseif TypeName == "buffer" then
 			BufferWriteU8(TargetBuffer, CursorPosition, 12)
-			return DataTypes.Buffer.Write(TargetBuffer, CursorPosition + 1, Value, InstanceAccumulator, InstanceLookup)
+			return DataTypes.Buffer.Write(TargetBuffer, CursorPosition + 1, Value :: buffer, InstanceAccumulator, InstanceLookup)
 		else 
 			error("Ion: Unsupported Any type " .. TypeName) 
 		end
 	end
 
-	local function ReadAny(TargetBuffer, CursorPosition, InstanceSource)
+	local function ReadAny(TargetBuffer : buffer, CursorPosition : number, InstanceSource : { Instance }) : (any, number)
 		CheckBounds(TargetBuffer, CursorPosition, 1)
 		local TypeId : number = BufferReadU8(TargetBuffer, CursorPosition)
 		CursorPosition += 1
@@ -921,7 +923,7 @@ do
 		elseif TypeId == 12 then return DataTypes.Buffer.Read(TargetBuffer, CursorPosition, InstanceSource)
 		else error("Ion: Corrupt Any type") end
 	end
-	
+
 	AnyTypeHandler = { IsDynamic = true, ContainsInstances = true, GetByteSize = GetAnySize, Write = WriteAny, Read = ReadAny }
 end
 DataTypes.Any = AnyTypeHandler
