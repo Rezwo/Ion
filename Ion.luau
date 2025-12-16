@@ -829,7 +829,21 @@ function DataTypes.Struct(StructureDefinition : { [string] : TypeSerializer<any>
 	end
 	return {
 		IsDynamic = IsDynamic, ContainsInstances = HasInstances,
-		GetByteSize = function(_) return 0 end,
+		GetByteSize = function(Value : { [string] : any }) : number
+			if not IsDynamic then
+				local Size = 0
+				for _, Key in ipairs(SortedKeys) do
+					Size += StructureDefinition[Key].GetByteSize(nil :: any)
+				end
+				return Size
+			else
+				local Size = 0
+				for _, Key in ipairs(SortedKeys) do
+					Size += StructureDefinition[Key].GetByteSize(Value[Key])
+				end
+				return Size
+			end
+		end,
 		Write = function(TargetBuffer, CursorPosition, Value, InstanceAccumulator, InstanceLookup)
 			for Index : number, Key : string in ipairs(SortedKeys) do
 				TargetBuffer, CursorPosition = FieldWriters[Index](TargetBuffer, CursorPosition, Value[Key], InstanceAccumulator, InstanceLookup)
@@ -1055,20 +1069,24 @@ function Ion.Define(
 		-- Early size check for unreliable packets
 		if IsUnreliable then
 			local EstimatedSize = 7 -- Header size
-			for Index, Serializer in ipairs(Schema) do
-				if Serializer.IsDynamic then
-					EstimatedSize += Serializer.GetByteSize(Args[Index])
-				else
-					EstimatedSize += Serializer.GetByteSize(nil :: any)
+			local EstimateSuccess = pcall(function()
+				for Index, Serializer in ipairs(Schema) do
+					if Serializer.IsDynamic then
+						EstimatedSize += Serializer.GetByteSize(Args[Index])
+					else
+						EstimatedSize += Serializer.GetByteSize(nil :: any)
+					end
 				end
-			end
+			end)
 			
-			if UseCompression and EstimatedSize > CompressThreshold then
-				EstimatedSize = math.ceil(EstimatedSize * 0.7)
-			end
-			
-			if EstimatedSize > MaxPacketSize then
-				warn("Ion: Unreliable packet likely too large (estimated "..EstimatedSize.." > "..MaxPacketSize.." bytes)")
+			if EstimateSuccess then
+				if UseCompression and EstimatedSize > CompressThreshold then
+					EstimatedSize = math.ceil(EstimatedSize * 0.7)
+				end
+				
+				if EstimatedSize > MaxPacketSize then
+					warn("Ion: Unreliable packet likely too large (estimated "..EstimatedSize.." > "..MaxPacketSize.." bytes)")
+				end
 			end
 		end
 		
