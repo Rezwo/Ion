@@ -46,12 +46,14 @@ local MathAbs = math.abs
 local IonVersion : number = 1
 local MaxPacketSize : number = 900
 local MaxCollectionSize : number = 16777215 -- 2^24-1
-local CompressionThreshold : number = 128 -- Bytes
+local CompressionThreshold : number = 128 -- Bytes (Default)
 local PoolCapacity : number = 64
 local PoolBufferSize : number = 4096
 local MaxSafeInteger : number = 9007199254740992 -- 2^53
+local MaxEnumCacheSize : number = 100
 
 local BufferPool : { buffer } = {}
+local BufferPoolInitialized : boolean = false
 
 export type IonPacket<T...> = {
 	Server : {
@@ -69,11 +71,16 @@ export type IonPacket<T...> = {
 
 export type Int64Struct = { Upper : number, Lower : number }
 
-for PoolIndex : number = 1, PoolCapacity do
-	table.insert(BufferPool, BufferCreate(PoolBufferSize))
+local function InitializeBufferPool()
+	if BufferPoolInitialized then return end
+	for PoolIndex : number = 1, PoolCapacity do
+		table.insert(BufferPool, BufferCreate(PoolBufferSize))
+	end
+	BufferPoolInitialized = true
 end
 
 local function AcquireBuffer(MinimumSize : number) : buffer
+	InitializeBufferPool()
 	if MinimumSize > PoolBufferSize then
 		return BufferCreate(MinimumSize)
 	end
@@ -241,13 +248,15 @@ DataTypes.UInt64 = {
 			Lower = Value.Lower or 0
 		elseif type(Value) == "string" then
 			local NumberValue : number = tonumber(Value) or 0
-			if NumberValue > MaxSafeInteger then warn("Ion: UInt64 string-to-number precision loss detected") end
+			if NumberValue > MaxSafeInteger then 
+				warn("Ion: UInt64 string-to-number precision loss detected for value: "..Value) 
+			end
 			Upper = MathFloor(NumberValue / 4294967296)
 			Lower = NumberValue % 4294967296
 		else
 			local NumberValue : number = tonumber(Value) or 0
 			if NumberValue > MaxSafeInteger then
-				error("Ion: Precision loss for UInt64 number. Use String or Int64Struct.")
+				error("Ion: Precision loss for UInt64 number ("..tostring(NumberValue).."). Use String or Int64Struct.")
 			end
 			Upper = MathFloor(NumberValue / 4294967296)
 			Lower = NumberValue % 4294967296
@@ -321,7 +330,7 @@ DataTypes.Int64 = {
 		else
 			local NumberValue : number = tonumber(Value) or 0
 			if MathAbs(NumberValue) > MaxSafeInteger then
-				error("Ion: Precision loss for Int64 number. Use String or Int64Struct.")
+				error("Ion: Precision loss for Int64 number ("..tostring(NumberValue).."). Use String or Int64Struct.")
 			end
 			High = MathFloor(NumberValue / 4294967296)
 			Low = NumberValue % 4294967296
@@ -770,6 +779,11 @@ function DataTypes.Map<K, V>(KeyType : TypeSerializer<K>, ValType : TypeSerializ
 		Write = function(TargetBuffer, CursorPosition, Value, InstanceAccumulator, InstanceLookup)
 			local Count : number = 0
 			for _ in pairs(Value) do Count += 1 end
+			
+			if Count > MaxCollectionSize then 
+				error("Ion: Map too large ("..Count.." > "..MaxCollectionSize..")") 
+			end
+			
 			TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 4)
 			BufferWriteU32(TargetBuffer, CursorPosition, Count)
 			CursorPosition += 4
@@ -833,6 +847,7 @@ function DataTypes.Struct(StructureDefinition : { [string] : TypeSerializer<any>
 end
 
 local AnyEnumCache : { [any] : { [number] : EnumItem } } = {}
+local EnumCacheOrder : { any } = {}
 
 DataTypes.Any = {
 	IsDynamic = true, ContainsInstances = true,
@@ -900,9 +915,15 @@ DataTypes.Any = {
 			if EType then
 				local Cache = AnyEnumCache[EType]
 				if not Cache then
+					if #EnumCacheOrder >= MaxEnumCacheSize then
+						local OldestKey = table.remove(EnumCacheOrder, 1)
+						AnyEnumCache[OldestKey] = nil
+					end
+					
 					Cache = {}
 					for _, Item in ipairs(EType:GetEnumItems()) do Cache[Item.Value] = Item end
 					AnyEnumCache[EType] = Cache
+					table.insert(EnumCacheOrder, EType)
 				end
 				return Cache[Val], NextPos + 2
 			end
@@ -919,12 +940,23 @@ local RemoteCache : { [number] : RemoteEvent | UnreliableRemoteEvent } = {}
 local Ion = {}
 Ion.Types = DataTypes
 
-function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Options : { Unreliable : boolean?, Compress : boolean?, Middleware : any?, SchemaVersion : number? }?)
+function Ion.Define(
+	Namespace : string, 
+	Schema : { TypeSerializer<any> }, 
+	Options : { 
+		Unreliable : boolean?, 
+		Compress : boolean?, 
+		CompressionThreshold : number?,
+		Middleware : any?, 
+		SchemaVersion : number? 
+	}?
+)
 	local Hash : number = FNV1a(Namespace)
 	if Definitions[Hash] then error("Ion: Namespace collision for '".. Namespace.. "'") end
 	Definitions[Hash] = Schema
 	local IsUnreliable = Options and Options.Unreliable or false
 	local UseCompression = Options and Options.Compress or false
+	local CompressThreshold = Options and Options.CompressionThreshold or CompressionThreshold
 	local Hooks = Options and Options.Middleware
 	local SchemaVersion = Options and Options.SchemaVersion or 1
 	local RemoteName = "Ion_".. Hash
@@ -939,7 +971,18 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 		local Flags = BufferReadU8(SourceBuffer, CursorPosition + 5)
 		local InSchemaVersion = BufferReadU8(SourceBuffer, CursorPosition + 6)
 		CursorPosition += 7
-		if Version ~= IonVersion or PacketId ~= Hash or InSchemaVersion ~= SchemaVersion then return end
+		
+		if Version ~= IonVersion then
+			warn("Ion: Version mismatch - Expected "..IonVersion..", got "..Version)
+			return
+		elseif PacketId ~= Hash then
+			warn("Ion: Packet ID mismatch - Expected "..Hash..", got "..PacketId)
+			return
+		elseif InSchemaVersion ~= SchemaVersion then
+			warn("Ion: Schema version mismatch for namespace - Expected "..SchemaVersion..", got "..InSchemaVersion)
+			return
+		end
+		
 		if Bit32BTest(Flags, 1) then
 			local PayloadSize = BufferLen(SourceBuffer) - 7
 			local CompressedPayload = BufferCreate(PayloadSize)
@@ -956,10 +999,16 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 				CursorPosition = NextPos
 			end
 			if RunService:IsServer() then
-				if Hooks and Hooks.OnAfterReceived then Hooks.OnAfterReceived(Player, table.unpack(Args)) end
+				if Hooks and Hooks.OnAfterReceived then
+					local success, err = pcall(Hooks.OnAfterReceived, Player, table.unpack(Args))
+					if not success then warn("Ion: Middleware OnAfterReceived error - "..tostring(err)) end
+				end
 				Callback(Player, table.unpack(Args))
 			else
-				if Hooks and Hooks.OnAfterReceived then Hooks.OnAfterReceived(table.unpack(Args)) end
+				if Hooks and Hooks.OnAfterReceived then
+					local success, err = pcall(Hooks.OnAfterReceived, table.unpack(Args))
+					if not success then warn("Ion: Middleware OnAfterReceived error - "..tostring(err)) end
+				end
 				Callback(table.unpack(Args))
 			end
 		end
@@ -972,15 +1021,57 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 		(Remote :: any).OnServerEvent:Connect(OnEvent)
 	else
 		local Remote = ReplicatedStorage:WaitForChild(RemoteName, 10)
-		if not Remote then error("Ion: Remote '"..RemoteName.."' not found") end
+		local RetryCount = 0
+		local MaxRetries = 5
+		
+		while not Remote and RetryCount < MaxRetries do
+			RetryCount += 1
+			warn("Ion: Remote '"..RemoteName.."' not found, retrying... ("..RetryCount.."/"..MaxRetries..")")
+			task.wait(2)
+			Remote = ReplicatedStorage:FindFirstChild(RemoteName)
+		end
+		
+		if not Remote then 
+			error("Ion: Remote '"..RemoteName.."' not found after "..MaxRetries.." retries") 
+		end
+		
 		RemoteCache[Hash] = Remote :: any
 		(Remote :: any).OnClientEvent:Connect(OnEvent)
 	end
 
-		local PacketObject = {}
-		function PacketObject.Send(Target : Player?,... : any) : boolean
-		if Hooks and Hooks.OnBeforeSend and not Hooks.OnBeforeSend(...) then return false end
-		local Args = {...}
+	local PacketObject = {}
+	function PacketObject.Send(Target : Player?,... : any) : boolean
+		if Hooks and Hooks.OnBeforeSend then
+			local success, result = pcall(Hooks.OnBeforeSend, ...)
+			if not success then
+				warn("Ion: Middleware OnBeforeSend error - "..tostring(result))
+				return false
+			end
+			if not result then return false end
+		end
+		
+		local Args = table.pack(...)
+		
+		-- Early size check for unreliable packets
+		if IsUnreliable then
+			local EstimatedSize = 7 -- Header size
+			for Index, Serializer in ipairs(Schema) do
+				if Serializer.IsDynamic then
+					EstimatedSize += Serializer.GetByteSize(Args[Index])
+				else
+					EstimatedSize += Serializer.GetByteSize(nil :: any)
+				end
+			end
+			
+			if UseCompression and EstimatedSize > CompressThreshold then
+				EstimatedSize = math.ceil(EstimatedSize * 0.7)
+			end
+			
+			if EstimatedSize > MaxPacketSize then
+				warn("Ion: Unreliable packet likely too large (estimated "..EstimatedSize.." > "..MaxPacketSize.." bytes)")
+			end
+		end
+		
 		local PayloadBuffer = AcquireBuffer(1024)
 		local Success, ResultCursor, ResultInst = pcall(function()
 			local Cursor, InstAcc, InstLook = 0, {}, {}
@@ -997,7 +1088,7 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 		ReleaseBuffer(PayloadBuffer)
 
 		local IsCompressed = false
-		if UseCompression and CursorPosition > CompressionThreshold then
+		if UseCompression and CursorPosition > CompressThreshold then
 			FinalPayload = EncodingService:CompressBuffer(FinalPayload, Enum.CompressionAlgorithm.Zstd)
 			IsCompressed = true
 		end
@@ -1009,7 +1100,6 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 		BufferWriteU8(PacketBuffer, 6, SchemaVersion)
 		BufferCopy(PacketBuffer, 7, FinalPayload, 0, BufferLen(FinalPayload))
 
-		-- Check unreliable size AFTER compression and header
 		if IsUnreliable and BufferLen(PacketBuffer) > MaxPacketSize then
 			warn("Ion: Unreliable packet too large ("..BufferLen(PacketBuffer).." > "..MaxPacketSize.." bytes)")
 			return false
@@ -1023,10 +1113,10 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 	end
 
 	function PacketObject.SendToList(Recipients : { Player }, ... : any) : { Player }
-		local Args = {...}
+		local Args = table.pack(...)
 		local Failed : { Player } = {}
 		for _, Player in ipairs(Recipients) do
-			if not PacketObject.Send(Player, table.unpack(Args)) then
+			if not PacketObject.Send(Player, table.unpack(Args, 1, Args.n)) then
 				table.insert(Failed, Player)
 			end
 		end
