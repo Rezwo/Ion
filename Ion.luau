@@ -63,7 +63,8 @@ local MaxEnumCacheSize : number = 100
 
 local BufferPool : { buffer } = {}
 local BufferPoolInitialized : boolean = false
-local EnumSerializerCache : { [any] : any } = {} -- Cache for UseEnum serializers
+local EnumSerializerCache : { [any] : any } = {} 
+local EnumSerializerCacheOrder : { any } = {} -- Track order for UseEnum LRU
 
 export type IonPacket<T...> = {
 	Server : {
@@ -546,6 +547,13 @@ DataTypes.Instance = {
 
 function DataTypes.UseEnum(EnumType : any) : TypeSerializer<EnumItem>
 	if EnumSerializerCache[EnumType] then return EnumSerializerCache[EnumType] end
+	
+	-- LRU Eviction for Schema Enum Cache
+	if #EnumSerializerCacheOrder >= MaxEnumCacheSize then
+		local Oldest = table.remove(EnumSerializerCacheOrder, 1)
+		EnumSerializerCache[Oldest] = nil
+	end
+	table.insert(EnumSerializerCacheOrder, EnumType)
 	
 	local EnumMap : { [number] : EnumItem } = {}
 	local Items = EnumType:GetEnumItems()
@@ -1193,10 +1201,17 @@ function Ion.Define(
 
 	function PacketObject.Listen(Callback) Listeners[Hash] = Callback end
 	function PacketObject.Destroy()
-		Listeners[Hash] = nil
-		if RemoteCache[Hash] then RemoteCache[Hash]:Destroy() RemoteCache[Hash] = nil end
-		Definitions[Hash] = nil
-	end
+			Listeners[Hash] = nil
+			local Remote = RemoteCache[Hash]
+			if Remote then 
+				-- Check if remote still exists/valid before attempting destroy
+				if typeof(Remote) == "Instance" and Remote.Parent then
+					Remote:Destroy()
+				end
+				RemoteCache[Hash] = nil 
+			end
+			Definitions[Hash] = nil
+		end
 
 	return {
 		Server = { 
