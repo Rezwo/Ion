@@ -51,7 +51,7 @@ local MathMax = math.max
 -- Constants
 local IonVersion : number = 1
 local MaxPacketSize : number = 900
-local MaxCollectionSize : number = 100000 -- Reduced from 16M to 100k to prevent allocation DoS
+local MaxCollectionSize : number = 100000 -- Limit collection size to prevent DoS
 local MaxStringSize : number = 1000000 -- 1MB Limit
 local CompressionThreshold : number = 128 -- Bytes
 local CompressionRatioEstimate : number = 0.7 -- Estimated ratio for size checks
@@ -99,7 +99,7 @@ end
 
 local function ReleaseBuffer(BufferToRelease : buffer)
 	if BufferLen(BufferToRelease) >= PoolBufferSize and #BufferPool < PoolCapacity then
-		-- Issue 8 Fix: Clear buffer data to prevent info leaks
+		-- Clear buffer data to prevent info leaks (only clearing pool size for efficiency)
 		BufferFill(BufferToRelease, 0, 0, PoolBufferSize)
 		table.insert(BufferPool, BufferToRelease)
 	end
@@ -112,10 +112,9 @@ local function EnsureCapacity(TargetBuffer : buffer, CursorPosition : number, Si
 		local NewBuffer : buffer = BufferCreate(NewLength)
 		BufferCopy(NewBuffer, 0, TargetBuffer, 0, CurrentLength)
 		
-		-- Issue 2 Fix: Return old buffer to pool if it was a pool-sized buffer
-		if CurrentLength == PoolBufferSize then
-			ReleaseBuffer(TargetBuffer)
-		end
+		-- CRITICAL FIX: Always release the old buffer. 
+		-- ReleaseBuffer handles validation internally.
+		ReleaseBuffer(TargetBuffer)
 		
 		return NewBuffer
 	end
@@ -267,7 +266,6 @@ DataTypes.UInt64 = {
 		elseif type(Value) == "string" then
 			local NumberValue : number = tonumber(Value) or 0
 			if NumberValue > MaxSafeInteger then 
-				-- Issue 4 Fix: Error consistently on precision loss
 				error("Ion: UInt64 string-to-number precision loss detected for value: "..Value) 
 			end
 			Upper = MathFloor(NumberValue / 4294967296)
@@ -346,6 +344,14 @@ DataTypes.Int64 = {
 		if type(Value) == "table" then
 			High = Value.Upper or 0
 			Low = Value.Lower or 0
+		elseif type(Value) == "string" then
+			-- Improved: Explicit string handling for consistency
+			local NumberValue : number = tonumber(Value) or 0
+			if MathAbs(NumberValue) > MaxSafeInteger then 
+				error("Ion: Int64 string-to-number precision loss detected for value: "..Value) 
+			end
+			High = MathFloor(NumberValue / 4294967296)
+			Low = NumberValue % 4294967296
 		else
 			local NumberValue : number = tonumber(Value) or 0
 			if MathAbs(NumberValue) > MaxSafeInteger then
@@ -428,7 +434,6 @@ DataTypes.String = {
 	GetByteSize = function(Value : string) : number return 4 + #Value end,
 	Write = function(TargetBuffer, CursorPosition, Value)
 		local Length : number = #Value
-		-- Issue 5 Fix: Add validation on write
 		if Length > MaxStringSize then error("Ion: String too large") end
 		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 4 + Length)
 		BufferWriteU32(TargetBuffer, CursorPosition, Length)
@@ -540,7 +545,6 @@ DataTypes.Instance = {
 } :: TypeSerializer<Instance?>
 
 function DataTypes.UseEnum(EnumType : any) : TypeSerializer<EnumItem>
-	-- Issue 7 Fix: Cache serializers to prevent duplicate creation
 	if EnumSerializerCache[EnumType] then return EnumSerializerCache[EnumType] end
 	
 	local EnumMap : { [number] : EnumItem } = {}
@@ -646,7 +650,6 @@ DataTypes.CFrameFloat16 = {
 		WriteFloat16(TargetBuffer, CursorPosition + 4, Value.Z)
 
 		local EulerX : number, EulerY : number, EulerZ : number = Value:ToEulerAnglesXYZ()
-		-- Issue 12 Fix: Use constant scaling factor
 		BufferWriteI16(TargetBuffer, CursorPosition + 6, MathClamp(MathRound(EulerX * EulerScalingFactor), -32768, 32767))
 		BufferWriteI16(TargetBuffer, CursorPosition + 8, MathClamp(MathRound(EulerY * EulerScalingFactor), -32768, 32767))
 		BufferWriteI16(TargetBuffer, CursorPosition + 10, MathClamp(MathRound(EulerZ * EulerScalingFactor), -32768, 32767))
@@ -779,7 +782,6 @@ function DataTypes.Array<T>(Inner : TypeSerializer<T>) : TypeSerializer<{ T }>
 		Read = function(TargetBuffer, CursorPosition, InstanceSource)
 			CheckBounds(TargetBuffer, CursorPosition, 4)
 			local Count : number = BufferReadU32(TargetBuffer, CursorPosition)
-			-- Issue 6 Fix: Check collection size before allocation
 			if Count > MaxCollectionSize then error("Ion: Array too large ("..Count.." > "..MaxCollectionSize..")") end
 			CursorPosition += 4
 			local Result : { T } = table.create(Count)
@@ -822,7 +824,6 @@ function DataTypes.Map<K, V>(KeyType : TypeSerializer<K>, ValType : TypeSerializ
 		Read = function(TargetBuffer, CursorPosition, InstanceSource)
 			CheckBounds(TargetBuffer, CursorPosition, 4)
 			local Count : number = BufferReadU32(TargetBuffer, CursorPosition)
-			-- Issue 6 Fix: Check collection size before processing
 			if Count > MaxCollectionSize then error("Ion: Map too large ("..Count.." > "..MaxCollectionSize..")") end
 			CursorPosition += 4
 			local Result : { [K] : V } = {}
@@ -933,6 +934,9 @@ DataTypes.Any = {
 		end
 	end,
 	Read = function(TargetBuffer, CursorPosition, InstSrc)
+		-- Type IDs: 0=nil, 1=boolean, 2=number, 3=string, 4=Instance, 5=Vector3, 
+		--           6=EnumItem, 7=CFrame, 8=Vector2, 9=Color3, 10=UDim2, 
+		--           11=DateTime, 12=buffer
 		CheckBounds(TargetBuffer, CursorPosition, 1)
 		local ID = BufferReadU8(TargetBuffer, CursorPosition)
 		CursorPosition += 1
@@ -970,7 +974,6 @@ DataTypes.Any = {
 			end
 			return nil, NextPos + 2
 		else
-			-- Issue 10 Fix: Handle unknown types
 			error("Ion: Corrupt Any type (ID: " .. ID .. ")")
 		end
 	end
@@ -1008,7 +1011,6 @@ function Ion.Define(
 		local SourceInstances = if RunService:IsServer() then Instances :: {Instance} else Data :: {Instance}
 		local CursorPosition : number = 0
 		
-		-- Issue 11 Fix: Wrap deserialization in pcall to catch malformed packet errors gracefully
 		local DeserializeSuccess, ErrorOrResult = pcall(function()
 			CheckBounds(SourceBuffer, CursorPosition, 7)
 			local Version = BufferReadU8(SourceBuffer, CursorPosition)
@@ -1028,7 +1030,6 @@ function Ion.Define(
 				return false
 			end
 			
-			-- Issue 1 Fix: Correctly check bit 1 (value 1)
 			if Bit32Band(Flags, 1) == 1 then
 				local PayloadSize = BufferLen(SourceBuffer) - 7
 				local CompressedPayload = BufferCreate(PayloadSize)
@@ -1044,12 +1045,11 @@ function Ion.Define(
 			return
 		end
 		
-		if ErrorOrResult == false then return end -- Version mismatch
+		if ErrorOrResult == false then return end
 
 		local Callback = Listeners[Hash]
 		if Callback then
 			local Args : { any } = {}
-			-- Wrap argument reading in pcall
 			local ReadSuccess, ReadError = pcall(function()
 				for _, Serializer in ipairs(Schema) do
 					local Value, NextPos = Serializer.Read(SourceBuffer, CursorPosition, SourceInstances)
@@ -1117,7 +1117,6 @@ function Ion.Define(
 		
 		local Args = table.pack(...)
 		
-		-- Early size check for unreliable packets
 		if IsUnreliable then
 			local EstimatedSize = 7 -- Header size
 			local EstimateSuccess = pcall(function()
@@ -1132,7 +1131,6 @@ function Ion.Define(
 			
 			if EstimateSuccess then
 				if UseCompression and EstimatedSize > CompressThreshold then
-					-- Issue 9 Fix: Use defined constant for ratio estimate
 					EstimatedSize = math.ceil(EstimatedSize * CompressionRatioEstimate)
 				end
 				
@@ -1166,7 +1164,6 @@ function Ion.Define(
 		local PacketBuffer = BufferCreate(7 + BufferLen(FinalPayload))
 		BufferWriteU8(PacketBuffer, 0, IonVersion)
 		BufferWriteU32(PacketBuffer, 1, Hash)
-		-- Issue 1 Fix: Explicitly write 1 or 0 (bit 0)
 		BufferWriteU8(PacketBuffer, 5, IsCompressed and 1 or 0)
 		BufferWriteU8(PacketBuffer, 6, SchemaVersion)
 		BufferCopy(PacketBuffer, 7, FinalPayload, 0, BufferLen(FinalPayload))
