@@ -977,8 +977,8 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 		(Remote :: any).OnClientEvent:Connect(OnEvent)
 	end
 
-	local PacketObject = {}
-	function PacketObject.Send(Target : Player?,... : any) : boolean
+		local PacketObject = {}
+		function PacketObject.Send(Target : Player?,... : any) : boolean
 		if Hooks and Hooks.OnBeforeSend and not Hooks.OnBeforeSend(...) then return false end
 		local Args = {...}
 		local PayloadBuffer = AcquireBuffer(1024)
@@ -992,8 +992,6 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 		if not Success then warn("Ion: Serialization failed - ".. tostring(ResultCursor)) ReleaseBuffer(PayloadBuffer) return false end
 		
 		local CursorPosition = ResultCursor :: number
-		if IsUnreliable and (CursorPosition + 7) > MaxPacketSize then warn("Ion: Unreliable packet dropped") ReleaseBuffer(PayloadBuffer) return false end
-		
 		local FinalPayload = BufferCreate(CursorPosition)
 		BufferCopy(FinalPayload, 0, PayloadBuffer, 0, CursorPosition)
 		ReleaseBuffer(PayloadBuffer)
@@ -1010,6 +1008,12 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 		BufferWriteU8(PacketBuffer, 5, IsCompressed and 1 or 0)
 		BufferWriteU8(PacketBuffer, 6, SchemaVersion)
 		BufferCopy(PacketBuffer, 7, FinalPayload, 0, BufferLen(FinalPayload))
+
+		-- Check unreliable size AFTER compression and header
+		if IsUnreliable and BufferLen(PacketBuffer) > MaxPacketSize then
+			warn("Ion: Unreliable packet too large ("..BufferLen(PacketBuffer).." > "..MaxPacketSize.." bytes)")
+			return false
+		end
 
 		local Remote : any = RemoteCache[Hash]
 		if RunService:IsServer() then
