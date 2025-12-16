@@ -7,7 +7,6 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Players = game:GetService("Players")
 local EncodingService = game:GetService("EncodingService")
 
--- Localize Buffer Library for speed
 local BufferWriteU8 = buffer.writeu8
 local BufferWriteU16 = buffer.writeu16
 local BufferWriteU32 = buffer.writeu32
@@ -30,7 +29,6 @@ local BufferReadF32 = buffer.readf32
 local BufferReadF64 = buffer.readf64
 local BufferReadString = buffer.readstring
 
--- Localize Bit32 Library
 local Bit32LShift = bit32.lshift
 local Bit32RShift = bit32.rshift
 local Bit32Band = bit32.band
@@ -38,7 +36,6 @@ local Bit32BTest = bit32.btest
 local Bit32Xor = bit32.bxor
 local Bit32Or = bit32.bor
 
--- Localize Math Library
 local MathFrexp = math.frexp
 local MathLdexp = math.ldexp
 local MathFloor = math.floor
@@ -46,7 +43,6 @@ local MathRound = math.round
 local MathClamp = math.clamp
 local MathAbs = math.abs
 
--- Configuration
 local IonVersion : number = 1
 local MaxPacketSize : number = 900
 local MaxCollectionSize : number = 16777215 -- 2^24-1
@@ -118,18 +114,17 @@ local function FNV1a(StringValue : string) : number
 	return Hash
 end
 
--- IEEE 754 Binary16 Encoder (Bias 15)
 local function WriteFloat16(TargetBuffer : buffer, CursorPosition : number, Value : number)
 	local Sign : number = if Value < 0 then 0x8000 else 0
 	Value = MathAbs(Value)
 
 	local Encoded : number = 0
 	
-	if Value >= 65504 then -- Infinity / Overflow
+	if Value >= 65504 then
 		Encoded = Sign + 0x7C00
 	elseif Value ~= 0 then
 		local Mantissa : number, Exponent : number = MathFrexp(Value)
-		Exponent += 14 -- Correct Bias 15 adjustment for frexp range [0.5, 1)
+		Exponent += 14
 
 		if Exponent <= 0 then
 			if Exponent < -10 then Encoded = Sign
