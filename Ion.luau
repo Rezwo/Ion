@@ -7,6 +7,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Players = game:GetService("Players")
 local EncodingService = game:GetService("EncodingService")
 
+-- Localize Buffer Library for speed
 local BufferWriteU8 = buffer.writeu8
 local BufferWriteU16 = buffer.writeu16
 local BufferWriteU32 = buffer.writeu32
@@ -29,13 +30,14 @@ local BufferReadF32 = buffer.readf32
 local BufferReadF64 = buffer.readf64
 local BufferReadString = buffer.readstring
 
+-- Localize Bit32 Library
 local Bit32LShift = bit32.lshift
 local Bit32RShift = bit32.rshift
 local Bit32Band = bit32.band
 local Bit32BTest = bit32.btest
 local Bit32Xor = bit32.bxor
-local Bit32Or = bit32.bor
 
+-- Localize Math Library
 local MathFrexp = math.frexp
 local MathLdexp = math.ldexp
 local MathFloor = math.floor
@@ -43,6 +45,7 @@ local MathRound = math.round
 local MathClamp = math.clamp
 local MathAbs = math.abs
 
+-- Configuration
 local IonVersion : number = 1
 local MaxPacketSize : number = 900
 local MaxCollectionSize : number = 16777215 -- 2^24-1
@@ -76,6 +79,7 @@ for PoolIndex : number = 1, PoolCapacity do
 end
 
 local function AcquireBuffer(MinimumSize : number) : buffer
+	-- If the requested size is huge, just alloc it directly to avoid polluting the pool with massive buffers
 	if MinimumSize > PoolBufferSize then
 		return BufferCreate(MinimumSize)
 	end
@@ -83,6 +87,7 @@ local function AcquireBuffer(MinimumSize : number) : buffer
 end
 
 local function ReleaseBuffer(BufferToRelease : buffer)
+	-- Recycle buffer only if it meets standard size and pool isn't full
 	if BufferLen(BufferToRelease) >= PoolBufferSize and #BufferPool < PoolCapacity then
 		table.insert(BufferPool, BufferToRelease)
 	end
@@ -114,17 +119,17 @@ local function FNV1a(StringValue : string) : number
 	return Hash
 end
 
+-- IEEE 754 Binary16 Encoder (Bias 15)
 local function WriteFloat16(TargetBuffer : buffer, CursorPosition : number, Value : number)
 	local Sign : number = if Value < 0 then 0x8000 else 0
 	Value = MathAbs(Value)
-
 	local Encoded : number = 0
 	
-	if Value >= 65504 then
+	if Value >= 65504 then -- Infinity / Overflow
 		Encoded = Sign + 0x7C00
 	elseif Value ~= 0 then
 		local Mantissa : number, Exponent : number = MathFrexp(Value)
-		Exponent += 14
+		Exponent += 14 -- Correct Bias 15 adjustment for frexp range [0.5, 1)
 
 		if Exponent <= 0 then
 			if Exponent < -10 then Encoded = Sign
@@ -283,6 +288,7 @@ DataTypes.String = {
 	end
 } :: TypeSerializer<string>
 
+-- Note: RestOfString handles the tail of the buffer. It must be the last element in a struct.
 DataTypes.RestOfString = {
 	IsDynamic = true, ContainsInstances = false, IsUnbounded = true,
 	GetByteSize = function(Value : string) : number return #Value end,
@@ -402,6 +408,177 @@ DataTypes.CFrame = {
 		return CFrame.fromAxisAngle(RotationVector / Angle, Angle) + PositionVector, CursorPosition + 24
 	end
 } :: TypeSerializer<CFrame>
+
+DataTypes.Vector2 = {
+	IsDynamic = false, ContainsInstances = false,
+	GetByteSize = function(_ : Vector2) : number return 8 end,
+	Write = function(TargetBuffer, CursorPosition, Value)
+		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 8)
+		BufferWriteF32(TargetBuffer, CursorPosition, Value.X)
+		BufferWriteF32(TargetBuffer, CursorPosition + 4, Value.Y)
+		return TargetBuffer, CursorPosition + 8
+	end,
+	Read = function(TargetBuffer, CursorPosition)
+		CheckBounds(TargetBuffer, CursorPosition, 8)
+		return Vector2.new(BufferReadF32(TargetBuffer, CursorPosition), BufferReadF32(TargetBuffer, CursorPosition + 4)), CursorPosition + 8
+	end
+} :: TypeSerializer<Vector2>
+
+DataTypes.Color3 = {
+	IsDynamic = false, ContainsInstances = false,
+	GetByteSize = function(_ : Color3) : number return 3 end,
+	Write = function(TargetBuffer, CursorPosition, Value : Color3)
+		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 3)
+		BufferWriteU8(TargetBuffer, CursorPosition, MathClamp(MathRound(Value.R * 255), 0, 255))
+		BufferWriteU8(TargetBuffer, CursorPosition + 1, MathClamp(MathRound(Value.G * 255), 0, 255))
+		BufferWriteU8(TargetBuffer, CursorPosition + 2, MathClamp(MathRound(Value.B * 255), 0, 255))
+		return TargetBuffer, CursorPosition + 3
+	end,
+	Read = function(TargetBuffer, CursorPosition)
+		CheckBounds(TargetBuffer, CursorPosition, 3)
+		return Color3.fromRGB(BufferReadU8(TargetBuffer, CursorPosition), BufferReadU8(TargetBuffer, CursorPosition + 1), BufferReadU8(TargetBuffer, CursorPosition + 2)), CursorPosition + 3
+	end
+} :: TypeSerializer<Color3>
+
+DataTypes.UDim2 = {
+	IsDynamic = false, ContainsInstances = false,
+	GetByteSize = function(_ : UDim2) : number return 16 end,
+	Write = function(TargetBuffer, CursorPosition, Value)
+		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 16)
+		BufferWriteF32(TargetBuffer, CursorPosition, Value.X.Scale)
+		BufferWriteI32(TargetBuffer, CursorPosition + 4, Value.X.Offset)
+		BufferWriteF32(TargetBuffer, CursorPosition + 8, Value.Y.Scale)
+		BufferWriteI32(TargetBuffer, CursorPosition + 12, Value.Y.Offset)
+		return TargetBuffer, CursorPosition + 16
+	end,
+	Read = function(TargetBuffer, CursorPosition)
+		CheckBounds(TargetBuffer, CursorPosition, 16)
+		return UDim2.new(BufferReadF32(TargetBuffer, CursorPosition), BufferReadI32(TargetBuffer, CursorPosition + 4), BufferReadF32(TargetBuffer, CursorPosition + 8), BufferReadI32(TargetBuffer, CursorPosition + 12)), CursorPosition + 16
+	end
+} :: TypeSerializer<UDim2>
+
+DataTypes.DateTime = {
+	IsDynamic = false, ContainsInstances = false,
+	GetByteSize = function(_ : DateTime) : number return 8 end,
+	Write = function(TargetBuffer, CursorPosition, Value)
+		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 8)
+		local NumberValue : number = Value.UnixTimestampMillis
+		local Upper : number = MathFloor(NumberValue / 4294967296)
+		local Lower : number = NumberValue % 4294967296
+		BufferWriteU32(TargetBuffer, CursorPosition, Upper)
+		BufferWriteU32(TargetBuffer, CursorPosition + 4, Lower)
+		return TargetBuffer, CursorPosition + 8
+	end,
+	Read = function(TargetBuffer, CursorPosition)
+		CheckBounds(TargetBuffer, CursorPosition, 8)
+		local Upper : number = BufferReadU32(TargetBuffer, CursorPosition)
+		local Lower : number = BufferReadU32(TargetBuffer, CursorPosition + 4)
+		return DateTime.fromUnixTimestampMillis(Upper * 4294967296 + Lower), CursorPosition + 8
+	end
+} :: TypeSerializer<DateTime>
+
+DataTypes.Buffer = {
+	IsDynamic = true, ContainsInstances = false,
+	GetByteSize = function(Value : buffer) : number return 4 + BufferLen(Value) end,
+	Write = function(TargetBuffer, CursorPosition, Value)
+		local Length : number = BufferLen(Value)
+		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 4 + Length)
+		BufferWriteU32(TargetBuffer, CursorPosition, Length)
+		BufferCopy(TargetBuffer, CursorPosition + 4, Value, 0, Length)
+		return TargetBuffer, CursorPosition + 4 + Length
+	end,
+	Read = function(TargetBuffer, CursorPosition)
+		CheckBounds(TargetBuffer, CursorPosition, 4)
+		local Length : number = BufferReadU32(TargetBuffer, CursorPosition)
+		if Length > 10485760 then error("Ion: Buffer too large") end
+		CheckBounds(TargetBuffer, CursorPosition + 4, Length)
+		local NewBuffer : buffer = BufferCreate(Length)
+		BufferCopy(NewBuffer, 0, TargetBuffer, CursorPosition + 4, Length)
+		return NewBuffer, CursorPosition + 4 + Length
+	end
+} :: TypeSerializer<buffer>
+
+-- Optimized Any Type with Enum Caching
+local AnyEnumCache : { [any] : { [number] : EnumItem } } = {}
+
+DataTypes.Any = {
+	IsDynamic = true, ContainsInstances = true,
+	GetByteSize = function(Value : any) : number
+		local T = typeof(Value)
+		if T == "number" then return 9
+		elseif T == "string" then return 5 + #Value
+		elseif T == "boolean" then return 2
+		elseif T == "Instance" then return 3
+		elseif T == "Vector3" then return 13
+		elseif T == "CFrame" then return 25
+		elseif T == "Vector2" then return 9
+		elseif T == "Color3" then return 4
+		elseif T == "UDim2" then return 17
+		elseif T == "DateTime" then return 9
+		elseif T == "buffer" then return 5 + BufferLen(Value)
+		elseif T == "EnumItem" then return 7 + #(tostring(Value.EnumType))
+		else return 1 end
+	end,
+	Write = function(Buff, Pos, Val, InstAcc, InstLook)
+		local T = typeof(Val)
+		Buff = EnsureCapacity(Buff, Pos, 1)
+		if Val == nil then BufferWriteU8(Buff, Pos, 0) return Buff, Pos + 1
+		elseif T == "boolean" then BufferWriteU8(Buff, Pos, 1) return DataTypes.Boolean.Write(Buff, Pos + 1, Val)
+		elseif T == "number" then BufferWriteU8(Buff, Pos, 2) return DataTypes.Float64.Write(Buff, Pos + 1, Val)
+		elseif T == "string" then BufferWriteU8(Buff, Pos, 3) return DataTypes.String.Write(Buff, Pos + 1, Val)
+		elseif T == "Instance" then BufferWriteU8(Buff, Pos, 4) return DataTypes.Instance.Write(Buff, Pos + 1, Val, InstAcc, InstLook)
+		elseif T == "Vector3" then BufferWriteU8(Buff, Pos, 5) return DataTypes.Vector3.Write(Buff, Pos + 1, Val)
+		elseif T == "CFrame" then BufferWriteU8(Buff, Pos, 7) return DataTypes.CFrame.Write(Buff, Pos + 1, Val)
+		elseif T == "Vector2" then BufferWriteU8(Buff, Pos, 8) return DataTypes.Vector2.Write(Buff, Pos + 1, Val)
+		elseif T == "Color3" then BufferWriteU8(Buff, Pos, 9) return DataTypes.Color3.Write(Buff, Pos + 1, Val)
+		elseif T == "UDim2" then BufferWriteU8(Buff, Pos, 10) return DataTypes.UDim2.Write(Buff, Pos + 1, Val)
+		elseif T == "DateTime" then BufferWriteU8(Buff, Pos, 11) return DataTypes.DateTime.Write(Buff, Pos + 1, Val)
+		elseif T == "buffer" then BufferWriteU8(Buff, Pos, 12) return DataTypes.Buffer.Write(Buff, Pos + 1, Val)
+		elseif T == "EnumItem" then
+			BufferWriteU8(Buff, Pos, 6)
+			Buff, Pos = DataTypes.String.Write(Buff, Pos + 1, tostring(Val.EnumType))
+			BufferWriteU16(Buff, Pos, Val.Value)
+			return Buff, Pos + 2
+		else
+			error("Ion: Unsupported Any type " .. T)
+		end
+	end,
+	Read = function(Buff, Pos, InstSrc)
+		CheckBounds(Buff, Pos, 1)
+		local ID = BufferReadU8(Buff, Pos)
+		Pos += 1
+		if ID == 0 then return nil, Pos
+		elseif ID == 1 then return DataTypes.Boolean.Read(Buff, Pos, InstSrc)
+		elseif ID == 2 then return DataTypes.Float64.Read(Buff, Pos, InstSrc)
+		elseif ID == 3 then return DataTypes.String.Read(Buff, Pos, InstSrc)
+		elseif ID == 4 then return DataTypes.Instance.Read(Buff, Pos, InstSrc)
+		elseif ID == 5 then return DataTypes.Vector3.Read(Buff, Pos, InstSrc)
+		elseif ID == 7 then return DataTypes.CFrame.Read(Buff, Pos, InstSrc)
+		elseif ID == 8 then return DataTypes.Vector2.Read(Buff, Pos, InstSrc)
+		elseif ID == 9 then return DataTypes.Color3.Read(Buff, Pos, InstSrc)
+		elseif ID == 10 then return DataTypes.UDim2.Read(Buff, Pos, InstSrc)
+		elseif ID == 11 then return DataTypes.DateTime.Read(Buff, Pos, InstSrc)
+		elseif ID == 12 then return DataTypes.Buffer.Read(Buff, Pos, InstSrc)
+		elseif ID == 6 then
+			local EName, NextPos = DataTypes.String.Read(Buff, Pos, InstSrc)
+			CheckBounds(Buff, NextPos, 2)
+			local Val = BufferReadU16(Buff, NextPos)
+			local EType = (Enum :: any)[EName]
+			if EType then
+				local Cache = AnyEnumCache[EType]
+				if not Cache then
+					Cache = {}
+					for _, Item in ipairs(EType:GetEnumItems()) do Cache[Item.Value] = Item end
+					AnyEnumCache[EType] = Cache
+				end
+				return Cache[Val], NextPos + 2
+			end
+			return nil, NextPos + 2
+		else
+			error("Ion: Corrupt Any type")
+		end
+	end
+} :: TypeSerializer<any>
 
 function DataTypes.Struct(StructureDefinition : { [string] : TypeSerializer<any> }) : TypeSerializer<{ [string] : any }>
 	local SortedKeys : { string } = {}
@@ -523,7 +700,7 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 
 		local IsCompressed = false
 		if UseCompression and CursorPosition > CompressionThreshold then
-			FinalPayload = EncodingService:DecompressBuffer(FinalPayload, Enum.CompressionAlgorithm.Zstd)
+			FinalPayload = EncodingService:CompressBuffer(FinalPayload, Enum.CompressionAlgorithm.Zstd)
 			IsCompressed = true
 		end
 		
