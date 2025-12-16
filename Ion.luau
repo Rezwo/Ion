@@ -168,7 +168,8 @@ DataTypes.UInt8 = {
 	GetByteSize = function(_ : number) : number return 1 end,
 	Write = function(TargetBuffer, CursorPosition, Value)
 		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 1)
-		BufferWriteU8(TargetBuffer, CursorPosition, Value or 0)
+		local Clamped = MathClamp(Value or 0, 0, 255)
+		BufferWriteU8(TargetBuffer, CursorPosition, Clamped)
 		return TargetBuffer, CursorPosition + 1
 	end,
 	Read = function(TargetBuffer, CursorPosition)
@@ -182,7 +183,8 @@ DataTypes.UInt16 = {
 	GetByteSize = function(_ : number) : number return 2 end,
 	Write = function(TargetBuffer, CursorPosition, Value)
 		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 2)
-		BufferWriteU16(TargetBuffer, CursorPosition, Value or 0)
+		local Clamped = MathClamp(Value or 0, 0, 65535)
+		BufferWriteU16(TargetBuffer, CursorPosition, Clamped)
 		return TargetBuffer, CursorPosition + 2
 	end,
 	Read = function(TargetBuffer, CursorPosition)
@@ -216,7 +218,8 @@ DataTypes.UInt32 = {
 	GetByteSize = function(_ : number) : number return 4 end,
 	Write = function(TargetBuffer, CursorPosition, Value)
 		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 4)
-		BufferWriteU32(TargetBuffer, CursorPosition, Value or 0)
+		local Clamped = MathClamp(Value or 0, 0, 4294967295)
+		BufferWriteU32(TargetBuffer, CursorPosition, Clamped)
 		return TargetBuffer, CursorPosition + 4
 	end,
 	Read = function(TargetBuffer, CursorPosition)
@@ -453,6 +456,9 @@ DataTypes.FixedString = function(Length : number) : TypeSerializer<string>
 		Write = function(TargetBuffer, CursorPosition, Value)
 			TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, Length)
 			local StringLength : number = #Value
+			if StringLength > Length then
+				warn("Ion: FixedString truncated from "..StringLength.." to "..Length.." bytes")
+			end
 			if StringLength >= Length then
 				BufferWriteString(TargetBuffer, CursorPosition, Value, Length)
 			else
@@ -739,7 +745,7 @@ function DataTypes.Array<T>(Inner : TypeSerializer<T>) : TypeSerializer<{ T }>
 		Read = function(TargetBuffer, CursorPosition, InstanceSource)
 			CheckBounds(TargetBuffer, CursorPosition, 4)
 			local Count : number = BufferReadU32(TargetBuffer, CursorPosition)
-			if Count > MaxCollectionSize then error("Ion: Array too large") end
+			if Count > MaxCollectionSize then error("Ion: Array too large ("..Count.." > "..MaxCollectionSize..")") end
 			CursorPosition += 4
 			local Result : { T } = table.create(Count)
 			for Index : number = 1, Count do 
@@ -776,7 +782,7 @@ function DataTypes.Map<K, V>(KeyType : TypeSerializer<K>, ValType : TypeSerializ
 		Read = function(TargetBuffer, CursorPosition, InstanceSource)
 			CheckBounds(TargetBuffer, CursorPosition, 4)
 			local Count : number = BufferReadU32(TargetBuffer, CursorPosition)
-			if Count > MaxCollectionSize then error("Ion: Map too large") end
+			if Count > MaxCollectionSize then error("Ion: Map too large ("..Count.." > "..MaxCollectionSize..")") end
 			CursorPosition += 4
 			local Result : { [K] : V } = {}
 			for Index : number = 1, Count do 
@@ -1012,6 +1018,17 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 		return true
 	end
 
+	function PacketObject.SendToList(Recipients : { Player }, ... : any) : { Player }
+		local Args = {...}
+		local Failed : { Player } = {}
+		for _, Player in ipairs(Recipients) do
+			if not PacketObject.Send(Player, table.unpack(Args)) then
+				table.insert(Failed, Player)
+			end
+		end
+		return Failed
+	end
+
 	function PacketObject.Listen(Callback) Listeners[Hash] = Callback end
 	function PacketObject.Destroy()
 		Listeners[Hash] = nil
@@ -1020,8 +1037,16 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 	end
 
 	return {
-		Server = { SendTo = function(P,...) return PacketObject.Send(P,...) end, SendToAll = function(...) return PacketObject.Send(nil,...) end, Listen = PacketObject.Listen },
-		Client = { Send = function(...) return PacketObject.Send(nil,...) end, Listen = PacketObject.Listen },
+		Server = { 
+			SendTo = function(P,...) return PacketObject.Send(P,...) end, 
+			SendToAll = function(...) return PacketObject.Send(nil,...) end,
+			SendToList = PacketObject.SendToList,
+			Listen = PacketObject.Listen 
+		},
+		Client = { 
+			Send = function(...) return PacketObject.Send(nil,...) end, 
+			Listen = PacketObject.Listen 
+		},
 		Destroy = PacketObject.Destroy
 	} :: IonPacket<any>
 end
