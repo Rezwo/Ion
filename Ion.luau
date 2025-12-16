@@ -99,8 +99,8 @@ end
 
 local function ReleaseBuffer(BufferToRelease : buffer)
 	if BufferLen(BufferToRelease) >= PoolBufferSize and #BufferPool < PoolCapacity then
-		-- Clear buffer data to prevent info leaks (only clearing pool size for efficiency)
-		BufferFill(BufferToRelease, 0, 0, PoolBufferSize)
+		-- Clear entire buffer data to prevent info leaks
+		BufferFill(BufferToRelease, 0, 0, BufferLen(BufferToRelease))
 		table.insert(BufferPool, BufferToRelease)
 	end
 end
