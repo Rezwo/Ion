@@ -935,7 +935,10 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 		CursorPosition += 7
 		if Version ~= IonVersion or PacketId ~= Hash or InSchemaVersion ~= SchemaVersion then return end
 		if Bit32BTest(Flags, 1) then
-			SourceBuffer = EncodingService:DecompressBuffer(SourceBuffer, Enum.CompressionAlgorithm.Zstd)
+			local PayloadSize = BufferLen(SourceBuffer) - 7
+			local CompressedPayload = BufferCreate(PayloadSize)
+			BufferCopy(CompressedPayload, 0, SourceBuffer, 7, PayloadSize)
+			SourceBuffer = EncodingService:DecompressBuffer(CompressedPayload, Enum.CompressionAlgorithm.Zstd)
 			CursorPosition = 0
 		end
 		local Callback = Listeners[Hash]
