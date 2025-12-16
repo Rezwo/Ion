@@ -7,7 +7,6 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Players = game:GetService("Players")
 local EncodingService = game:GetService("EncodingService")
 
--- Localize Buffer Library for speed
 local BufferWriteU8 = buffer.writeu8
 local BufferWriteU16 = buffer.writeu16
 local BufferWriteU32 = buffer.writeu32
@@ -30,14 +29,13 @@ local BufferReadF32 = buffer.readf32
 local BufferReadF64 = buffer.readf64
 local BufferReadString = buffer.readstring
 
--- Localize Bit32 Library
 local Bit32LShift = bit32.lshift
 local Bit32RShift = bit32.rshift
 local Bit32Band = bit32.band
 local Bit32BTest = bit32.btest
 local Bit32Xor = bit32.bxor
+local Bit32Or = bit32.bor
 
--- Localize Math Library
 local MathFrexp = math.frexp
 local MathLdexp = math.ldexp
 local MathFloor = math.floor
@@ -45,7 +43,6 @@ local MathRound = math.round
 local MathClamp = math.clamp
 local MathAbs = math.abs
 
--- Configuration
 local IonVersion : number = 1
 local MaxPacketSize : number = 900
 local MaxCollectionSize : number = 16777215 -- 2^24-1
@@ -54,7 +51,6 @@ local PoolCapacity : number = 64
 local PoolBufferSize : number = 4096
 local MaxSafeInteger : number = 9007199254740992 -- 2^53
 
--- Buffer Pool State
 local BufferPool : { buffer } = {}
 
 export type IonPacket<T...> = {
@@ -73,13 +69,11 @@ export type IonPacket<T...> = {
 
 export type Int64Struct = { Upper : number, Lower : number }
 
--- Initialize Pool
 for PoolIndex : number = 1, PoolCapacity do
 	table.insert(BufferPool, BufferCreate(PoolBufferSize))
 end
 
 local function AcquireBuffer(MinimumSize : number) : buffer
-	-- If the requested size is huge, just alloc it directly to avoid polluting the pool with massive buffers
 	if MinimumSize > PoolBufferSize then
 		return BufferCreate(MinimumSize)
 	end
@@ -87,7 +81,6 @@ local function AcquireBuffer(MinimumSize : number) : buffer
 end
 
 local function ReleaseBuffer(BufferToRelease : buffer)
-	-- Recycle buffer only if it meets standard size and pool isn't full
 	if BufferLen(BufferToRelease) >= PoolBufferSize and #BufferPool < PoolCapacity then
 		table.insert(BufferPool, BufferToRelease)
 	end
@@ -119,17 +112,16 @@ local function FNV1a(StringValue : string) : number
 	return Hash
 end
 
--- IEEE 754 Binary16 Encoder (Bias 15)
 local function WriteFloat16(TargetBuffer : buffer, CursorPosition : number, Value : number)
 	local Sign : number = if Value < 0 then 0x8000 else 0
 	Value = MathAbs(Value)
 	local Encoded : number = 0
 	
-	if Value >= 65504 then -- Infinity / Overflow
+	if Value >= 65504 then
 		Encoded = Sign + 0x7C00
 	elseif Value ~= 0 then
 		local Mantissa : number, Exponent : number = MathFrexp(Value)
-		Exponent += 14 -- Correct Bias 15 adjustment for frexp range [0.5, 1)
+		Exponent += 14
 
 		if Exponent <= 0 then
 			if Exponent < -10 then Encoded = Sign
@@ -199,6 +191,26 @@ DataTypes.UInt16 = {
 	end
 } :: TypeSerializer<number>
 
+DataTypes.UInt24 = {
+	IsDynamic = false, ContainsInstances = false,
+	GetByteSize = function(_ : number) : number return 3 end,
+	Write = function(TargetBuffer, CursorPosition, Value) 
+		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 3)
+		local Clamped : number = MathClamp(Value or 0, 0, 16777215)
+		BufferWriteU8(TargetBuffer, CursorPosition, Bit32Band(Clamped, 0xFF))
+		BufferWriteU8(TargetBuffer, CursorPosition + 1, Bit32Band(Bit32RShift(Clamped, 8), 0xFF))
+		BufferWriteU8(TargetBuffer, CursorPosition + 2, Bit32Band(Bit32RShift(Clamped, 16), 0xFF))
+		return TargetBuffer, CursorPosition + 3 
+	end,
+	Read = function(TargetBuffer, CursorPosition) 
+		CheckBounds(TargetBuffer, CursorPosition, 3)
+		local Byte1 : number = BufferReadU8(TargetBuffer, CursorPosition)
+		local Byte2 : number = BufferReadU8(TargetBuffer, CursorPosition + 1)
+		local Byte3 : number = BufferReadU8(TargetBuffer, CursorPosition + 2)
+		return Byte1 + Bit32LShift(Byte2, 8) + Bit32LShift(Byte3, 16), CursorPosition + 3 
+	end
+} :: TypeSerializer<number>
+
 DataTypes.UInt32 = {
 	IsDynamic = false, ContainsInstances = false,
 	GetByteSize = function(_ : number) : number return 4 end,
@@ -212,6 +224,117 @@ DataTypes.UInt32 = {
 		return BufferReadU32(TargetBuffer, CursorPosition), CursorPosition + 4
 	end
 } :: TypeSerializer<number>
+
+DataTypes.UInt64 = {
+	IsDynamic = false, ContainsInstances = false,
+	GetByteSize = function(_ : any) : number return 8 end,
+	Write = function(TargetBuffer, CursorPosition, Value)
+		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 8)
+		local Upper : number
+		local Lower : number
+
+		if type(Value) == "table" then
+			Upper = Value.Upper or 0
+			Lower = Value.Lower or 0
+		elseif type(Value) == "string" then
+			local NumberValue : number = tonumber(Value) or 0
+			if NumberValue > MaxSafeInteger then warn("Ion: UInt64 string-to-number precision loss detected") end
+			Upper = MathFloor(NumberValue / 4294967296)
+			Lower = NumberValue % 4294967296
+		else
+			local NumberValue : number = tonumber(Value) or 0
+			if NumberValue > MaxSafeInteger then
+				error("Ion: Precision loss for UInt64 number. Use String or Int64Struct.")
+			end
+			Upper = MathFloor(NumberValue / 4294967296)
+			Lower = NumberValue % 4294967296
+		end
+
+		BufferWriteU32(TargetBuffer, CursorPosition, Upper)
+		BufferWriteU32(TargetBuffer, CursorPosition + 4, Lower)
+		return TargetBuffer, CursorPosition + 8
+	end,
+	Read = function(TargetBuffer, CursorPosition)
+		CheckBounds(TargetBuffer, CursorPosition, 8)
+		local Upper : number = BufferReadU32(TargetBuffer, CursorPosition)
+		local Lower : number = BufferReadU32(TargetBuffer, CursorPosition + 4)
+		return { Upper = Upper, Lower = Lower }, CursorPosition + 8
+	end
+} :: TypeSerializer<Int64Struct | number | string>
+
+DataTypes.Int8 = {
+	IsDynamic = false, ContainsInstances = false,
+	GetByteSize = function(_ : number) : number return 1 end,
+	Write = function(TargetBuffer, CursorPosition, Value) 
+		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 1)
+		BufferWriteI8(TargetBuffer, CursorPosition, Value or 0)
+		return TargetBuffer, CursorPosition + 1 
+	end,
+	Read = function(TargetBuffer, CursorPosition) 
+		CheckBounds(TargetBuffer, CursorPosition, 1)
+		return BufferReadI8(TargetBuffer, CursorPosition), CursorPosition + 1 
+	end
+} :: TypeSerializer<number>
+
+DataTypes.Int16 = {
+	IsDynamic = false, ContainsInstances = false,
+	GetByteSize = function(_ : number) : number return 2 end,
+	Write = function(TargetBuffer, CursorPosition, Value) 
+		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 2)
+		BufferWriteI16(TargetBuffer, CursorPosition, Value or 0)
+		return TargetBuffer, CursorPosition + 2 
+	end,
+	Read = function(TargetBuffer, CursorPosition) 
+		CheckBounds(TargetBuffer, CursorPosition, 2)
+		return BufferReadI16(TargetBuffer, CursorPosition), CursorPosition + 2 
+	end
+} :: TypeSerializer<number>
+
+DataTypes.Int32 = {
+	IsDynamic = false, ContainsInstances = false,
+	GetByteSize = function(_ : number) : number return 4 end,
+	Write = function(TargetBuffer, CursorPosition, Value) 
+		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 4)
+		BufferWriteI32(TargetBuffer, CursorPosition, Value or 0)
+		return TargetBuffer, CursorPosition + 4 
+	end,
+	Read = function(TargetBuffer, CursorPosition) 
+		CheckBounds(TargetBuffer, CursorPosition, 4)
+		return BufferReadI32(TargetBuffer, CursorPosition), CursorPosition + 4 
+	end
+} :: TypeSerializer<number>
+
+DataTypes.Int64 = {
+	IsDynamic = false, ContainsInstances = false,
+	GetByteSize = function(_ : any) : number return 8 end,
+	Write = function(TargetBuffer, CursorPosition, Value)
+		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 8)
+		local High : number
+		local Low : number
+
+		if type(Value) == "table" then
+			High = Value.Upper or 0
+			Low = Value.Lower or 0
+		else
+			local NumberValue : number = tonumber(Value) or 0
+			if MathAbs(NumberValue) > MaxSafeInteger then
+				error("Ion: Precision loss for Int64 number. Use String or Int64Struct.")
+			end
+			High = MathFloor(NumberValue / 4294967296)
+			Low = NumberValue % 4294967296
+		end
+
+		BufferWriteI32(TargetBuffer, CursorPosition, High)
+		BufferWriteU32(TargetBuffer, CursorPosition + 4, Low)
+		return TargetBuffer, CursorPosition + 8
+	end,
+	Read = function(TargetBuffer, CursorPosition)
+		CheckBounds(TargetBuffer, CursorPosition, 8)
+		local High : number = BufferReadI32(TargetBuffer, CursorPosition)
+		local Low : number = BufferReadU32(TargetBuffer, CursorPosition + 4)
+		return { Upper = High, Lower = Low }, CursorPosition + 8
+	end
+} :: TypeSerializer<Int64Struct | number | string>
 
 DataTypes.Float16 = {
 	IsDynamic = false, ContainsInstances = false,
@@ -288,7 +411,25 @@ DataTypes.String = {
 	end
 } :: TypeSerializer<string>
 
--- Note: RestOfString handles the tail of the buffer. It must be the last element in a struct.
+DataTypes.ShortString = {
+	IsDynamic = true, ContainsInstances = false,
+	GetByteSize = function(Value : string) : number return 1 + #Value end,
+	Write = function(TargetBuffer, CursorPosition, Value)
+		local Length : number = #Value
+		if Length > 255 then error("Ion: ShortString exceeds 255 bytes") end
+		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 1 + Length)
+		BufferWriteU8(TargetBuffer, CursorPosition, Length)
+		BufferWriteString(TargetBuffer, CursorPosition + 1, Value)
+		return TargetBuffer, CursorPosition + 1 + Length
+	end,
+	Read = function(TargetBuffer, CursorPosition)
+		CheckBounds(TargetBuffer, CursorPosition, 1)
+		local Length : number = BufferReadU8(TargetBuffer, CursorPosition)
+		CheckBounds(TargetBuffer, CursorPosition + 1, Length)
+		return BufferReadString(TargetBuffer, CursorPosition + 1, Length), CursorPosition + 1 + Length
+	end
+} :: TypeSerializer<string>
+
 DataTypes.RestOfString = {
 	IsDynamic = true, ContainsInstances = false, IsUnbounded = true,
 	GetByteSize = function(Value : string) : number return #Value end,
@@ -304,6 +445,35 @@ DataTypes.RestOfString = {
 		return BufferReadString(TargetBuffer, CursorPosition, Remaining), CursorPosition + Remaining
 	end
 } :: TypeSerializer<string>
+
+DataTypes.FixedString = function(Length : number) : TypeSerializer<string>
+	return {
+		IsDynamic = false, ContainsInstances = false,
+		GetByteSize = function(_ : string) : number return Length end,
+		Write = function(TargetBuffer, CursorPosition, Value)
+			TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, Length)
+			local StringLength : number = #Value
+			if StringLength >= Length then
+				BufferWriteString(TargetBuffer, CursorPosition, Value, Length)
+			else
+				BufferWriteString(TargetBuffer, CursorPosition, Value)
+				for Offset : number = StringLength, Length - 1 do
+					BufferWriteU8(TargetBuffer, CursorPosition + Offset, 0)
+				end
+			end
+			return TargetBuffer, CursorPosition + Length
+		end,
+		Read = function(TargetBuffer, CursorPosition)
+			CheckBounds(TargetBuffer, CursorPosition, Length)
+			local RawString : string = BufferReadString(TargetBuffer, CursorPosition, Length)
+			local NullPos = string.find(RawString, "\0")
+			if NullPos then
+				return string.sub(RawString, 1, NullPos - 1), CursorPosition + Length
+			end
+			return RawString, CursorPosition + Length
+		end
+	}
+end
 
 DataTypes.Instance = {
 	IsDynamic = false, ContainsInstances = true,
@@ -374,6 +544,22 @@ DataTypes.Vector3 = {
 	end
 } :: TypeSerializer<Vector3>
 
+DataTypes.Vector3Int16 = {
+	IsDynamic = false, ContainsInstances = false,
+	GetByteSize = function(_ : Vector3) : number return 6 end,
+	Write = function(TargetBuffer, CursorPosition, Value)
+		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 6)
+		BufferWriteI16(TargetBuffer, CursorPosition, MathClamp(MathRound(Value.X), -32768, 32767))
+		BufferWriteI16(TargetBuffer, CursorPosition + 2, MathClamp(MathRound(Value.Y), -32768, 32767))
+		BufferWriteI16(TargetBuffer, CursorPosition + 4, MathClamp(MathRound(Value.Z), -32768, 32767))
+		return TargetBuffer, CursorPosition + 6
+	end,
+	Read = function(TargetBuffer, CursorPosition)
+		CheckBounds(TargetBuffer, CursorPosition, 6)
+		return Vector3.new(BufferReadI16(TargetBuffer, CursorPosition), BufferReadI16(TargetBuffer, CursorPosition + 2), BufferReadI16(TargetBuffer, CursorPosition + 4)), CursorPosition + 6
+	end
+} :: TypeSerializer<Vector3>
+
 DataTypes.CFrame = {
 	IsDynamic = false, ContainsInstances = false,
 	GetByteSize = function(_ : CFrame) : number return 24 end,
@@ -406,6 +592,36 @@ DataTypes.CFrame = {
 		local Angle : number = RotationVector.Magnitude
 		if Angle < 0.001 then return CFrame.new(PositionVector), CursorPosition + 24 end
 		return CFrame.fromAxisAngle(RotationVector / Angle, Angle) + PositionVector, CursorPosition + 24
+	end
+} :: TypeSerializer<CFrame>
+
+DataTypes.CFrameFloat16 = {
+	IsDynamic = false, ContainsInstances = false,
+	GetByteSize = function(_ : CFrame) : number return 12 end,
+	Write = function(TargetBuffer, CursorPosition, Value)
+		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 12)
+		WriteFloat16(TargetBuffer, CursorPosition, Value.X)
+		WriteFloat16(TargetBuffer, CursorPosition + 2, Value.Y)
+		WriteFloat16(TargetBuffer, CursorPosition + 4, Value.Z)
+
+		local EulerX : number, EulerY : number, EulerZ : number = Value:ToEulerAnglesXYZ()
+		local ScalingFactor : number = 10430.2191955
+		BufferWriteI16(TargetBuffer, CursorPosition + 6, MathClamp(MathRound(EulerX * ScalingFactor), -32768, 32767))
+		BufferWriteI16(TargetBuffer, CursorPosition + 8, MathClamp(MathRound(EulerY * ScalingFactor), -32768, 32767))
+		BufferWriteI16(TargetBuffer, CursorPosition + 10, MathClamp(MathRound(EulerZ * ScalingFactor), -32768, 32767))
+		return TargetBuffer, CursorPosition + 12
+	end,
+	Read = function(TargetBuffer, CursorPosition)
+		CheckBounds(TargetBuffer, CursorPosition, 12)
+		local PositionX : number = ReadFloat16(TargetBuffer, CursorPosition)
+		local PositionY : number = ReadFloat16(TargetBuffer, CursorPosition + 2)
+		local PositionZ : number = ReadFloat16(TargetBuffer, CursorPosition + 4)
+		local ScalingFactor : number = 10430.2191955
+		local EulerX : number = BufferReadI16(TargetBuffer, CursorPosition + 6) / ScalingFactor
+		local EulerY : number = BufferReadI16(TargetBuffer, CursorPosition + 8) / ScalingFactor
+		local EulerZ : number = BufferReadI16(TargetBuffer, CursorPosition + 10) / ScalingFactor
+
+		return CFrame.fromEulerAnglesXYZ(EulerX, EulerY, EulerZ) + Vector3.new(PositionX, PositionY, PositionZ), CursorPosition + 12
 	end
 } :: TypeSerializer<CFrame>
 
@@ -498,87 +714,81 @@ DataTypes.Buffer = {
 	end
 } :: TypeSerializer<buffer>
 
--- Optimized Any Type with Enum Caching
-local AnyEnumCache : { [any] : { [number] : EnumItem } } = {}
-
-DataTypes.Any = {
-	IsDynamic = true, ContainsInstances = true,
-	GetByteSize = function(Value : any) : number
-		local T = typeof(Value)
-		if T == "number" then return 9
-		elseif T == "string" then return 5 + #Value
-		elseif T == "boolean" then return 2
-		elseif T == "Instance" then return 3
-		elseif T == "Vector3" then return 13
-		elseif T == "CFrame" then return 25
-		elseif T == "Vector2" then return 9
-		elseif T == "Color3" then return 4
-		elseif T == "UDim2" then return 17
-		elseif T == "DateTime" then return 9
-		elseif T == "buffer" then return 5 + BufferLen(Value)
-		elseif T == "EnumItem" then return 7 + #(tostring(Value.EnumType))
-		else return 1 end
-	end,
-	Write = function(Buff, Pos, Val, InstAcc, InstLook)
-		local T = typeof(Val)
-		Buff = EnsureCapacity(Buff, Pos, 1)
-		if Val == nil then BufferWriteU8(Buff, Pos, 0) return Buff, Pos + 1
-		elseif T == "boolean" then BufferWriteU8(Buff, Pos, 1) return DataTypes.Boolean.Write(Buff, Pos + 1, Val)
-		elseif T == "number" then BufferWriteU8(Buff, Pos, 2) return DataTypes.Float64.Write(Buff, Pos + 1, Val)
-		elseif T == "string" then BufferWriteU8(Buff, Pos, 3) return DataTypes.String.Write(Buff, Pos + 1, Val)
-		elseif T == "Instance" then BufferWriteU8(Buff, Pos, 4) return DataTypes.Instance.Write(Buff, Pos + 1, Val, InstAcc, InstLook)
-		elseif T == "Vector3" then BufferWriteU8(Buff, Pos, 5) return DataTypes.Vector3.Write(Buff, Pos + 1, Val)
-		elseif T == "CFrame" then BufferWriteU8(Buff, Pos, 7) return DataTypes.CFrame.Write(Buff, Pos + 1, Val)
-		elseif T == "Vector2" then BufferWriteU8(Buff, Pos, 8) return DataTypes.Vector2.Write(Buff, Pos + 1, Val)
-		elseif T == "Color3" then BufferWriteU8(Buff, Pos, 9) return DataTypes.Color3.Write(Buff, Pos + 1, Val)
-		elseif T == "UDim2" then BufferWriteU8(Buff, Pos, 10) return DataTypes.UDim2.Write(Buff, Pos + 1, Val)
-		elseif T == "DateTime" then BufferWriteU8(Buff, Pos, 11) return DataTypes.DateTime.Write(Buff, Pos + 1, Val)
-		elseif T == "buffer" then BufferWriteU8(Buff, Pos, 12) return DataTypes.Buffer.Write(Buff, Pos + 1, Val)
-		elseif T == "EnumItem" then
-			BufferWriteU8(Buff, Pos, 6)
-			Buff, Pos = DataTypes.String.Write(Buff, Pos + 1, tostring(Val.EnumType))
-			BufferWriteU16(Buff, Pos, Val.Value)
-			return Buff, Pos + 2
-		else
-			error("Ion: Unsupported Any type " .. T)
-		end
-	end,
-	Read = function(Buff, Pos, InstSrc)
-		CheckBounds(Buff, Pos, 1)
-		local ID = BufferReadU8(Buff, Pos)
-		Pos += 1
-		if ID == 0 then return nil, Pos
-		elseif ID == 1 then return DataTypes.Boolean.Read(Buff, Pos, InstSrc)
-		elseif ID == 2 then return DataTypes.Float64.Read(Buff, Pos, InstSrc)
-		elseif ID == 3 then return DataTypes.String.Read(Buff, Pos, InstSrc)
-		elseif ID == 4 then return DataTypes.Instance.Read(Buff, Pos, InstSrc)
-		elseif ID == 5 then return DataTypes.Vector3.Read(Buff, Pos, InstSrc)
-		elseif ID == 7 then return DataTypes.CFrame.Read(Buff, Pos, InstSrc)
-		elseif ID == 8 then return DataTypes.Vector2.Read(Buff, Pos, InstSrc)
-		elseif ID == 9 then return DataTypes.Color3.Read(Buff, Pos, InstSrc)
-		elseif ID == 10 then return DataTypes.UDim2.Read(Buff, Pos, InstSrc)
-		elseif ID == 11 then return DataTypes.DateTime.Read(Buff, Pos, InstSrc)
-		elseif ID == 12 then return DataTypes.Buffer.Read(Buff, Pos, InstSrc)
-		elseif ID == 6 then
-			local EName, NextPos = DataTypes.String.Read(Buff, Pos, InstSrc)
-			CheckBounds(Buff, NextPos, 2)
-			local Val = BufferReadU16(Buff, NextPos)
-			local EType = (Enum :: any)[EName]
-			if EType then
-				local Cache = AnyEnumCache[EType]
-				if not Cache then
-					Cache = {}
-					for _, Item in ipairs(EType:GetEnumItems()) do Cache[Item.Value] = Item end
-					AnyEnumCache[EType] = Cache
-				end
-				return Cache[Val], NextPos + 2
+function DataTypes.Array<T>(Inner : TypeSerializer<T>) : TypeSerializer<{ T }>
+	if Inner.IsUnbounded then error("Ion: RestOfString cannot be used inside Array") end
+	return {
+		IsDynamic = true, ContainsInstances = Inner.ContainsInstances,
+		GetByteSize = function(Value : { T }) : number
+			if not Inner.IsDynamic then
+				return 4 + (#Value * Inner.GetByteSize(nil :: any))
 			end
-			return nil, NextPos + 2
-		else
-			error("Ion: Corrupt Any type")
+			local Size : number = 4
+			for _, Item : T in ipairs(Value) do Size += Inner.GetByteSize(Item) end
+			return Size
+		end,
+		Write = function(TargetBuffer, CursorPosition, Value, InstanceAccumulator, InstanceLookup)
+			local Count : number = #Value
+			TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 4)
+			BufferWriteU32(TargetBuffer, CursorPosition, Count)
+			CursorPosition += 4
+			for Index : number = 1, Count do 
+				TargetBuffer, CursorPosition = Inner.Write(TargetBuffer, CursorPosition, Value[Index], InstanceAccumulator, InstanceLookup) 
+			end
+			return TargetBuffer, CursorPosition
+		end,
+		Read = function(TargetBuffer, CursorPosition, InstanceSource)
+			CheckBounds(TargetBuffer, CursorPosition, 4)
+			local Count : number = BufferReadU32(TargetBuffer, CursorPosition)
+			if Count > MaxCollectionSize then error("Ion: Array too large") end
+			CursorPosition += 4
+			local Result : { T } = table.create(Count)
+			for Index : number = 1, Count do 
+				local Item : T
+				Item, CursorPosition = Inner.Read(TargetBuffer, CursorPosition, InstanceSource)
+				Result[Index] = Item 
+			end
+			return Result, CursorPosition
 		end
-	end
-} :: TypeSerializer<any>
+	}
+end
+
+function DataTypes.Map<K, V>(KeyType : TypeSerializer<K>, ValType : TypeSerializer<V>) : TypeSerializer<{ [K] : V }>
+	if KeyType.IsUnbounded or ValType.IsUnbounded then error("Ion: RestOfString cannot be used inside Map") end
+	return {
+		IsDynamic = true, ContainsInstances = KeyType.ContainsInstances or ValType.ContainsInstances,
+		GetByteSize = function(Value : { [K] : V }) : number
+			local Size : number = 4
+			for Key : K, Val : V in pairs(Value) do Size += KeyType.GetByteSize(Key) + ValType.GetByteSize(Val) end
+			return Size
+		end,
+		Write = function(TargetBuffer, CursorPosition, Value, InstanceAccumulator, InstanceLookup)
+			local Count : number = 0
+			for _ in pairs(Value) do Count += 1 end
+			TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 4)
+			BufferWriteU32(TargetBuffer, CursorPosition, Count)
+			CursorPosition += 4
+			for Key : K, Val : V in pairs(Value) do 
+				TargetBuffer, CursorPosition = KeyType.Write(TargetBuffer, CursorPosition, Key, InstanceAccumulator, InstanceLookup)
+				TargetBuffer, CursorPosition = ValType.Write(TargetBuffer, CursorPosition, Val, InstanceAccumulator, InstanceLookup) 
+			end
+			return TargetBuffer, CursorPosition
+		end,
+		Read = function(TargetBuffer, CursorPosition, InstanceSource)
+			CheckBounds(TargetBuffer, CursorPosition, 4)
+			local Count : number = BufferReadU32(TargetBuffer, CursorPosition)
+			if Count > MaxCollectionSize then error("Ion: Map too large") end
+			CursorPosition += 4
+			local Result : { [K] : V } = {}
+			for Index : number = 1, Count do 
+				local Key : K, Val : V
+				Key, CursorPosition = KeyType.Read(TargetBuffer, CursorPosition, InstanceSource)
+				Val, CursorPosition = ValType.Read(TargetBuffer, CursorPosition, InstanceSource)
+				Result[Key] = Val 
+			end
+			return Result, CursorPosition
+		end
+	}
+end
 
 function DataTypes.Struct(StructureDefinition : { [string] : TypeSerializer<any> }) : TypeSerializer<{ [string] : any }>
 	local SortedKeys : { string } = {}
@@ -616,6 +826,87 @@ function DataTypes.Struct(StructureDefinition : { [string] : TypeSerializer<any>
 	}
 end
 
+local AnyEnumCache : { [any] : { [number] : EnumItem } } = {}
+
+DataTypes.Any = {
+	IsDynamic = true, ContainsInstances = true,
+	GetByteSize = function(Value : any) : number
+		local T = typeof(Value)
+		if T == "number" then return 9
+		elseif T == "string" then return 5 + #Value
+		elseif T == "boolean" then return 2
+		elseif T == "Instance" then return 3
+		elseif T == "Vector3" then return 13
+		elseif T == "CFrame" then return 25
+		elseif T == "Vector2" then return 9
+		elseif T == "Color3" then return 4
+		elseif T == "UDim2" then return 17
+		elseif T == "DateTime" then return 9
+		elseif T == "buffer" then return 5 + BufferLen(Value)
+		elseif T == "EnumItem" then return 7 + #(tostring(Value.EnumType))
+		else return 1 end
+	end,
+	Write = function(TargetBuffer, CursorPosition, Val, InstAcc, InstLook)
+		local T = typeof(Val)
+		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 1)
+		if Val == nil then BufferWriteU8(TargetBuffer, CursorPosition, 0) return TargetBuffer, CursorPosition + 1
+		elseif T == "boolean" then BufferWriteU8(TargetBuffer, CursorPosition, 1) return DataTypes.Boolean.Write(TargetBuffer, CursorPosition + 1, Val)
+		elseif T == "number" then BufferWriteU8(TargetBuffer, CursorPosition, 2) return DataTypes.Float64.Write(TargetBuffer, CursorPosition + 1, Val)
+		elseif T == "string" then BufferWriteU8(TargetBuffer, CursorPosition, 3) return DataTypes.String.Write(TargetBuffer, CursorPosition + 1, Val)
+		elseif T == "Instance" then BufferWriteU8(TargetBuffer, CursorPosition, 4) return DataTypes.Instance.Write(TargetBuffer, CursorPosition + 1, Val, InstAcc, InstLook)
+		elseif T == "Vector3" then BufferWriteU8(TargetBuffer, CursorPosition, 5) return DataTypes.Vector3.Write(TargetBuffer, CursorPosition + 1, Val)
+		elseif T == "CFrame" then BufferWriteU8(TargetBuffer, CursorPosition, 7) return DataTypes.CFrame.Write(TargetBuffer, CursorPosition + 1, Val)
+		elseif T == "Vector2" then BufferWriteU8(TargetBuffer, CursorPosition, 8) return DataTypes.Vector2.Write(TargetBuffer, CursorPosition + 1, Val)
+		elseif T == "Color3" then BufferWriteU8(TargetBuffer, CursorPosition, 9) return DataTypes.Color3.Write(TargetBuffer, CursorPosition + 1, Val)
+		elseif T == "UDim2" then BufferWriteU8(TargetBuffer, CursorPosition, 10) return DataTypes.UDim2.Write(TargetBuffer, CursorPosition + 1, Val)
+		elseif T == "DateTime" then BufferWriteU8(TargetBuffer, CursorPosition, 11) return DataTypes.DateTime.Write(TargetBuffer, CursorPosition + 1, Val)
+		elseif T == "buffer" then BufferWriteU8(TargetBuffer, CursorPosition, 12) return DataTypes.Buffer.Write(TargetBuffer, CursorPosition + 1, Val)
+		elseif T == "EnumItem" then
+			BufferWriteU8(TargetBuffer, CursorPosition, 6)
+			TargetBuffer, CursorPosition = DataTypes.String.Write(TargetBuffer, CursorPosition + 1, tostring(Val.EnumType))
+			BufferWriteU16(TargetBuffer, CursorPosition, Val.Value)
+			return TargetBuffer, CursorPosition + 2
+		else
+			error("Ion: Unsupported Any type " .. T)
+		end
+	end,
+	Read = function(TargetBuffer, CursorPosition, InstSrc)
+		CheckBounds(TargetBuffer, CursorPosition, 1)
+		local ID = BufferReadU8(TargetBuffer, CursorPosition)
+		CursorPosition += 1
+		if ID == 0 then return nil, CursorPosition
+		elseif ID == 1 then return DataTypes.Boolean.Read(TargetBuffer, CursorPosition, InstSrc)
+		elseif ID == 2 then return DataTypes.Float64.Read(TargetBuffer, CursorPosition, InstSrc)
+		elseif ID == 3 then return DataTypes.String.Read(TargetBuffer, CursorPosition, InstSrc)
+		elseif ID == 4 then return DataTypes.Instance.Read(TargetBuffer, CursorPosition, InstSrc)
+		elseif ID == 5 then return DataTypes.Vector3.Read(TargetBuffer, CursorPosition, InstSrc)
+		elseif ID == 7 then return DataTypes.CFrame.Read(TargetBuffer, CursorPosition, InstSrc)
+		elseif ID == 8 then return DataTypes.Vector2.Read(TargetBuffer, CursorPosition, InstSrc)
+		elseif ID == 9 then return DataTypes.Color3.Read(TargetBuffer, CursorPosition, InstSrc)
+		elseif ID == 10 then return DataTypes.UDim2.Read(TargetBuffer, CursorPosition, InstSrc)
+		elseif ID == 11 then return DataTypes.DateTime.Read(TargetBuffer, CursorPosition, InstSrc)
+		elseif ID == 12 then return DataTypes.Buffer.Read(TargetBuffer, CursorPosition, InstSrc)
+		elseif ID == 6 then
+			local EName, NextPos = DataTypes.String.Read(TargetBuffer, CursorPosition, InstSrc)
+			CheckBounds(TargetBuffer, NextPos, 2)
+			local Val = BufferReadU16(TargetBuffer, NextPos)
+			local EType = (Enum :: any)[EName]
+			if EType then
+				local Cache = AnyEnumCache[EType]
+				if not Cache then
+					Cache = {}
+					for _, Item in ipairs(EType:GetEnumItems()) do Cache[Item.Value] = Item end
+					AnyEnumCache[EType] = Cache
+				end
+				return Cache[Val], NextPos + 2
+			end
+			return nil, NextPos + 2
+		else
+			error("Ion: Corrupt Any type")
+		end
+	end
+} :: TypeSerializer<any>
+
 local Definitions : { [number] : { TypeSerializer<any> } } = {}
 local Listeners : { [number] : (...any) -> () } = {}
 local RemoteCache : { [number] : RemoteEvent | UnreliableRemoteEvent } = {}
@@ -643,7 +934,7 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 		local InSchemaVersion = BufferReadU8(SourceBuffer, CursorPosition + 6)
 		CursorPosition += 7
 		if Version ~= IonVersion or PacketId ~= Hash or InSchemaVersion ~= SchemaVersion then return end
-		if Bit32BTest(Flags, 1) then -- Bit 0 set (Value 1)
+		if Bit32BTest(Flags, 1) then
 			SourceBuffer = EncodingService:DecompressBuffer(SourceBuffer, Enum.CompressionAlgorithm.Zstd)
 			CursorPosition = 0
 		end
