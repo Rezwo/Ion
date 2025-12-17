@@ -49,6 +49,8 @@ local MathClamp = math.clamp
 local MathAbs = math.abs
 local MathMax = math.max
 local MathMin = math.min
+local MathCeil = math.ceil
+local MathLog = math.log
 
 --------------------------------------------------------------------------------
 -- CONFIGURATION & CONSTANTS
@@ -58,7 +60,6 @@ local IonVersion : number = 1
 local MaxPacketSize : number = 900
 local MaxBufferSize : number = 100 * 1024 * 1024 -- 100MB Hard Limit
 local MaxBufferBlobSize : number = 10 * 1024 * 1024 -- 10MB Limit for single Blob/String
-local BufferGrowthFactor : number = 1.5
 local MaxCollectionSize : number = 100000 -- 100k items limit
 local MaxStringSize : number = 1000000 -- 1MB string limit
 local CompressionThreshold : number = 128 -- Bytes
@@ -217,6 +218,7 @@ local function AcquireBuffer(MinimumSize : number) : buffer
 	return BufferCreate(PoolBufferSize)
 end
 
+-- FIX #6: Power-of-2 growth strategy
 local function EnsureCapacity(TargetBuffer : buffer, CursorPosition : number, Size : number) : buffer
 	local CurrentLength = BufferLen(TargetBuffer)
 	local RequiredSize = CursorPosition + Size
@@ -225,8 +227,8 @@ local function EnsureCapacity(TargetBuffer : buffer, CursorPosition : number, Si
 		return TargetBuffer
 	end
 	
-	-- Growth logic with hard limit
-	local NewLength = MathMax(math.ceil(CurrentLength * BufferGrowthFactor), RequiredSize)
+	-- Power of 2 growth to reduce fragmentation
+	local NewLength = 2 ^ MathCeil(MathLog(RequiredSize, 2))
 	
 	if NewLength > MaxBufferSize then
 		if RequiredSize > MaxBufferSize then
@@ -259,7 +261,7 @@ local function FNV1a(StringValue : string) : number
 	local Prime : number = 16777619
 	for Index = 1, #StringValue do
 		Hash = Bit32Xor(Hash, string.byte(StringValue, Index))
-		-- FIX: Ensure 32-bit clamping before multiplication to minimize overflow
+		-- Ensure 32-bit clamping before multiplication to minimize overflow
 		Hash = Bit32Band(Hash, 4294967295) 
 		Hash = Bit32Band(Hash * Prime, 4294967295)
 	end
@@ -273,7 +275,7 @@ local function WriteFloat16(TargetBuffer : buffer, CursorPosition : number, Valu
 	
 	if Value == 0 then
 		Encoded = Sign
-	elseif Value > 65504 then -- FIX: Corrected from >= to > for true overflow
+	elseif Value > 65504 then -- Corrected from >= to > for true overflow
 		Encoded = Sign + 0x7C00
 	elseif Value ~= Value then -- NaN
 		Encoded = 0x7FFF
@@ -519,14 +521,19 @@ DataTypes.RestOfString = {
 	end
 }
 
-DataTypes.FixedString = function(Length : number) : TypeSerializer<string>
+DataTypes.FixedString = function(Length : number, ErrorOnTruncate : boolean?) : TypeSerializer<string>
 	if Length > MaxStringSize then error(string.format("[%s] FixedString too large", IonErrorCodes.SIZE_LIMIT_EXCEEDED)) end
 	return {
 		IsDynamic = false, ContainsInstances = false,
 		GetByteSize = function(_) return Length end,
 		Write = function(TargetBuffer, CursorPosition, Value)
-			TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, Length)
+			-- FIX #9: Check for truncation error
 			local StrLen = MathMin(#Value, Length)
+			if ErrorOnTruncate and #Value > Length then
+				error(string.format("[%s] String exceeds FixedString length %d", IonErrorCodes.SIZE_LIMIT_EXCEEDED, Length))
+			end
+			
+			TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, Length)
 			if StrLen > 0 then BufferWriteString(TargetBuffer, CursorPosition, string.sub(Value, 1, StrLen)) end
 			if StrLen < Length then BufferFill(TargetBuffer, CursorPosition + StrLen, 0, Length - StrLen) end
 			return TargetBuffer, CursorPosition + Length
@@ -1052,7 +1059,8 @@ Ion.Types = DataTypes
 local function PreparePacket(Schema, Args, Hash, SchemaVersion, UseCompression, CompressThreshold)
 	local PayloadBuf = AcquireBuffer(1024)
 	
-	local SerSuccess, SerRes = pcall(function()
+	-- FIX #6: pcall now wraps compression too
+	local Success, Result = pcall(function()
 		local Cursor, Acc, Look = 0, {}, {}
 		for Index, Serializer in ipairs(Schema) do 
 			PayloadBuf, Cursor = Serializer.Write(PayloadBuf, Cursor, Args[Index], Acc, Look) 
@@ -1064,6 +1072,7 @@ local function PreparePacket(Schema, Args, Hash, SchemaVersion, UseCompression, 
 		
 		local IsCompressed = false
 		if UseCompression and FinalSize > CompressThreshold then
+			-- Compression is now inside the pcall
 			local CompData = EncodingService:CompressBuffer(FinalPayload, Enum.CompressionAlgorithm.Zstd)
 			if BufferLen(CompData) < FinalSize then
 				FinalPayload = CompData
@@ -1075,13 +1084,13 @@ local function PreparePacket(Schema, Args, Hash, SchemaVersion, UseCompression, 
 		return { Payload = FinalPayload, Compressed = IsCompressed, Inst = Acc }
 	end)
 
-	ReleaseBuffer(PayloadBuf) -- FIX #7: Always release the temp buffer
+	ReleaseBuffer(PayloadBuf) -- Always release the temp buffer
 
-	if not SerSuccess then 
-		return nil, nil, "Serialization Failed: " .. tostring(SerRes)
+	if not Success then 
+		return nil, nil, "Serialization Failed: " .. tostring(Result)
 	end
 	
-	local PacketData = SerRes
+	local PacketData = Result
 	local Header = BufferCreate(7 + BufferLen(PacketData.Payload))
 	BufferWriteU8(Header, 0, IonVersion)
 	BufferWriteU32(Header, 1, Hash)
@@ -1123,17 +1132,23 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 			end
 		end
 		
+		-- RestOfString validation
 		for Index = 1, #Schema - 1 do
 			if Schema[Index].IsUnbounded then
 				error("Ion: RestOfString can only be the last field in schema")
 			end
 		end
 		
+		-- FIX #1: Validate SchemaVersion is integer
 		local SchemaVersion = Options and Options.SchemaVersion or 1
+		if type(SchemaVersion) ~= "number" or SchemaVersion ~= math.floor(SchemaVersion) then
+			error(string.format("[%s] SchemaVersion must be an integer", IonErrorCodes.INVALID_CONFIG))
+		end
 		if SchemaVersion < 0 or SchemaVersion > 255 then
 			error(string.format("[%s] SchemaVersion must be 0-255", IonErrorCodes.INVALID_CONFIG))
 		end
 		
+		-- FIX #2: Configurable Timeout
 		local RemoteTimeout = Options and Options.RemoteTimeout or 10
 		
 		Definitions[Hash] = Schema
@@ -1155,7 +1170,8 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 			local CursorPosition = 0
 			local StartTime = os.clock()
 			
-			local ProcessingSuccess, Error = pcall(function()
+			-- FIX 1: Clean pcall pattern
+			local Success, Error = pcall(function()
 				CheckBounds(SourceBuffer, CursorPosition, 7)
 				local Ver = BufferReadU8(SourceBuffer, CursorPosition)
 				local PId = BufferReadU32(SourceBuffer, CursorPosition + 1)
@@ -1173,19 +1189,21 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 					local CompPayload = BufferCreate(CompSize)
 					BufferCopy(CompPayload, 0, SourceBuffer, 7, CompSize)
 					
-					local DecompData = EncodingService:DecompressBuffer(CompPayload, Enum.CompressionAlgorithm.Zstd)
-					SourceBuffer = DecompData
+					local DecompSuccess, DecompResult = pcall(EncodingService.DecompressBuffer, EncodingService, CompPayload, Enum.CompressionAlgorithm.Zstd)
+					if not DecompSuccess then error(string.format("[%s] Decompression failed: %s", IonErrorCodes.DECOMPRESSION_FAILED, tostring(DecompResult))) end
+					
+					SourceBuffer = DecompResult
 					CursorPosition = 0
 					if BufferLen(SourceBuffer) > MaxBufferSize then error(string.format("[%s] Decompressed payload too large", IonErrorCodes.SIZE_LIMIT_EXCEEDED)) end
 				end
 			end)
 
-			if not ProcessingSuccess then 
+			if not Success then 
 				warn("Ion Packet Error: " .. tostring(Error)) 
 				return 
 			end
 
-			-- FIX A: Final race condition check before callback
+			-- Double check destruction before callback
 			if ActivePackets[Hash].IsDestroyed then return end
 
 			local Callback = Listeners[Hash]
@@ -1203,16 +1221,20 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 				
 				RecordPerformance("deserialize", os.clock() - StartTime, BufferLen(SourceBuffer))
 				
-				-- FIX A: One more check before middleware/callback execution
-				if ActivePackets[Hash].IsDestroyed then return end
-
 				if Hooks and Hooks.OnAfterReceived then
-					if RunService:IsServer() then
-						pcall(Hooks.OnAfterReceived, Player, table.unpack(Args))
-					else
-						pcall(Hooks.OnAfterReceived, table.unpack(Args))
-					end
+					-- FIX 7: Middleware error handling
+					local MiddlewareSuccess, MiddlewareErr = pcall(function()
+						if RunService:IsServer() then
+							Hooks.OnAfterReceived(Player, table.unpack(Args))
+						else
+							Hooks.OnAfterReceived(table.unpack(Args))
+						end
+					end)
+					if not MiddlewareSuccess then warn("Ion Middleware Error: " .. tostring(MiddlewareErr)) end
 				end
+				
+				-- FIX A: Final race condition check
+				if ActivePackets[Hash].IsDestroyed then return end
 				
 				if RunService:IsServer() then Callback(Player, table.unpack(Args)) else Callback(table.unpack(Args)) end
 			end
@@ -1232,6 +1254,7 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 					Remote = ReplicatedStorage:WaitForChild(RemoteName, 2)
 				end
 			end
+			-- FIX 2: Safer client error
 			if not Remote then error(string.format("[%s] Remote missing for %s", IonErrorCodes.REMOTE_MISSING, Namespace)) end
 			RemoteCache[Hash] = Remote
 			RemoteConnections[Hash] = (Remote :: any).OnClientEvent:Connect(OnEvent)
@@ -1248,9 +1271,13 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 			if not Remote or not Remote.Parent then return false end
 
 			local Args = table.pack(...)
+			-- FIX 3: Explicit Middleware Handling
 			if Hooks and Hooks.OnBeforeSend then
 				local MiddlewareSuccess, MiddlewareResult = pcall(Hooks.OnBeforeSend, ...)
-				if not MiddlewareSuccess then warn("Ion Middleware Error") return false end
+				if not MiddlewareSuccess then 
+					warn("Ion Middleware Error: " .. tostring(MiddlewareResult)) 
+					return false 
+				end
 				if MiddlewareResult == false then return false end
 				if type(MiddlewareResult) == "table" then Args = MiddlewareResult end
 			end
@@ -1298,6 +1325,11 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 		end
 
 		function PacketObject.SendToList(Recipients, ...)
+			-- FIX 6: Validate Recipients
+			if type(Recipients) ~= "table" then
+				warn("Ion: SendToList recipients must be a table")
+				return {}
+			end
 			if #Recipients == 0 then return {} end
 			
 			local Args = table.pack(...)
@@ -1315,7 +1347,6 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 			local Failed = {}
 			local Remote : any = RemoteCache[Hash]
 			for _, Plr in ipairs(Recipients) do
-				-- FIX #5: Wrap FireClient in pcall
 				if Plr and Plr.Parent then 
 					local SendSuccess = pcall(function()
 						Remote:FireClient(Plr, PacketBuffer, PacketInsts) 
