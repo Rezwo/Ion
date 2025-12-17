@@ -252,27 +252,27 @@ end
 local function EnsureCapacity(TargetBuffer : buffer, CursorPosition : number, Size : number) : buffer
 	local CurrentLength = BufferLen(TargetBuffer)
 	local RequiredSize = CursorPosition + Size
-	
+
 	if RequiredSize <= CurrentLength then
 		return TargetBuffer
 	end
-	
+
 	-- Power of 2 growth to reduce fragmentation
 	local NewLength = 2 ^ MathCeil(MathLog(RequiredSize, 2))
-	
+
 	if NewLength > MaxBufferSize then
 		if RequiredSize > MaxBufferSize then
 			error(string.format("[%s] Ion: Buffer overflow - Required %d > Max %d", IonErrorCodes.BUFFER_OVERFLOW, RequiredSize, MaxBufferSize))
 		end
 		NewLength = MaxBufferSize
 	end
-	
+
 	local NewBuffer = BufferCreate(NewLength)
 	BufferCopy(NewBuffer, 0, TargetBuffer, 0, CurrentLength)
-	
+
 	-- Always release the old buffer (ReleaseBuffer handles validation)
 	ReleaseBuffer(TargetBuffer)
-	
+
 	return NewBuffer
 end
 
@@ -302,7 +302,7 @@ local function WriteFloat16(TargetBuffer : buffer, CursorPosition : number, Valu
 	local Sign : number = if Value < 0 then 0x8000 else 0
 	Value = MathAbs(Value)
 	local Encoded : number = 0
-	
+
 	if Value == 0 then
 		Encoded = Sign
 	elseif Value > 65504 then -- Value > MaxFloat16
@@ -367,14 +367,14 @@ end
 local DataTypes = {}
 
 -- Primitives
-local function CreatePrimitive(Size, WriteFunc, ReadFunc, ClampMin, ClampMax)
+local function CreatePrimitive(Size: number, WriteFunc: (buffer, number, number) -> (), ReadFunc: (buffer, number) -> number, ClampMin: number?, ClampMax: number?) : TypeSerializer<number>
 	return {
 		IsDynamic = false, ContainsInstances = false,
 		GetByteSize = function(_ : any) return Size end,
 		Write = function(TargetBuffer, CursorPosition, Value)
 			TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, Size)
 			local SafeValue = Value or 0
-			if ClampMin then SafeValue = MathClamp(SafeValue, ClampMin, ClampMax) end
+			if ClampMin and ClampMax then SafeValue = MathClamp(SafeValue, ClampMin, ClampMax) end
 			WriteFunc(TargetBuffer, CursorPosition, SafeValue)
 			return TargetBuffer, CursorPosition + Size
 		end,
@@ -412,7 +412,7 @@ DataTypes.UInt24 = {
 		local Byte3 = BufferReadU8(TargetBuffer, CursorPosition + 2)
 		return Byte1 + Bit32LShift(Byte2, 8) + Bit32LShift(Byte3, 16), CursorPosition + 3 
 	end
-}
+} :: TypeSerializer<number>
 
 DataTypes.Float16 = {
 	IsDynamic = false, ContainsInstances = false,
@@ -426,7 +426,7 @@ DataTypes.Float16 = {
 		CheckBounds(TargetBuffer, CursorPosition, 2)
 		return ReadFloat16(TargetBuffer, CursorPosition), CursorPosition + 2
 	end
-}
+} :: TypeSerializer<number>
 
 DataTypes.Boolean = {
 	IsDynamic = false, ContainsInstances = false,
@@ -440,7 +440,7 @@ DataTypes.Boolean = {
 		CheckBounds(TargetBuffer, CursorPosition, 1)
 		return BufferReadU8(TargetBuffer, CursorPosition) == 1, CursorPosition + 1
 	end
-}
+} :: TypeSerializer<boolean>
 
 DataTypes.UInt64 = {
 	IsDynamic = false, ContainsInstances = false,
@@ -468,7 +468,7 @@ DataTypes.UInt64 = {
 		CheckBounds(TargetBuffer, CursorPosition, 8)
 		return { Upper = BufferReadU32(TargetBuffer, CursorPosition), Lower = BufferReadU32(TargetBuffer, CursorPosition + 4) }, CursorPosition + 8
 	end
-}
+} :: TypeSerializer<Int64Struct | number | string>
 
 DataTypes.Int64 = {
 	IsDynamic = false, ContainsInstances = false,
@@ -490,7 +490,7 @@ DataTypes.Int64 = {
 		CheckBounds(TargetBuffer, CursorPosition, 8)
 		return { Upper = BufferReadI32(TargetBuffer, CursorPosition), Lower = BufferReadU32(TargetBuffer, CursorPosition + 4) }, CursorPosition + 8
 	end
-}
+} :: TypeSerializer<Int64Struct | number | string>
 
 DataTypes.String = {
 	IsDynamic = true, ContainsInstances = false,
@@ -511,7 +511,7 @@ DataTypes.String = {
 		if Length == 0 then return "", CursorPosition + 4 end
 		return BufferReadString(TargetBuffer, CursorPosition + 4, Length), CursorPosition + 4 + Length
 	end
-}
+} :: TypeSerializer<string>
 
 DataTypes.ShortString = {
 	IsDynamic = true, ContainsInstances = false,
@@ -530,7 +530,7 @@ DataTypes.ShortString = {
 		CheckBounds(TargetBuffer, CursorPosition + 1, Length)
 		return BufferReadString(TargetBuffer, CursorPosition + 1, Length), CursorPosition + 1 + Length
 	end
-}
+} :: TypeSerializer<string>
 
 DataTypes.RestOfString = {
 	IsDynamic = true, ContainsInstances = false, IsUnbounded = true,
@@ -549,7 +549,7 @@ DataTypes.RestOfString = {
 		if Remaining <= 0 then return "", CursorPosition end
 		return BufferReadString(TargetBuffer, CursorPosition, Remaining), CursorPosition + Remaining
 	end
-}
+} :: TypeSerializer<string>
 
 DataTypes.FixedString = function(Length : number, ErrorOnTruncate : boolean?) : TypeSerializer<string>
 	if Length > MaxStringSize then error(string.format("[%s] FixedString too large", IonErrorCodes.SIZE_LIMIT_EXCEEDED)) end
@@ -561,7 +561,7 @@ DataTypes.FixedString = function(Length : number, ErrorOnTruncate : boolean?) : 
 			if ErrorOnTruncate and #Value > Length then
 				error(string.format("[%s] String exceeds FixedString length %d", IonErrorCodes.SIZE_LIMIT_EXCEEDED, Length))
 			end
-			
+
 			TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, Length)
 			if StrLen > 0 then BufferWriteString(TargetBuffer, CursorPosition, string.sub(Value, 1, StrLen)) end
 			if StrLen < Length then BufferFill(TargetBuffer, CursorPosition + StrLen, 0, Length - StrLen) end
@@ -613,7 +613,7 @@ DataTypes.Instance = {
 			local Success, Result = pcall(function() return Value:IsDescendantOf(game) end)
 			IsValid = Success and Result
 		end
-		
+
 		if IsValid then
 			local Index = InstanceLookup[Value]
 			if Index then
@@ -639,8 +639,8 @@ DataTypes.Instance = {
 } :: TypeSerializer<Instance?>
 
 function DataTypes.UseEnum(EnumType : any) : TypeSerializer<EnumItem>
-	if EnumSerializerCache[EnumType] then return EnumSerializerCache[EnumType] end
-	
+	if EnumSerializerCache[EnumType] then return EnumSerializerCache[EnumType] :: TypeSerializer<EnumItem> end
+
 	if #EnumSerializerCacheOrder >= MaxEnumCacheSize then
 		local Oldest = table.remove(EnumSerializerCacheOrder, 1)
 		EnumSerializerCache[Oldest] = nil
@@ -674,13 +674,13 @@ function DataTypes.UseEnum(EnumType : any) : TypeSerializer<EnumItem>
 		end
 	}
 	EnumSerializerCache[EnumType] = Serializer
-	return Serializer
+	return Serializer :: TypeSerializer<EnumItem>
 end
 
 DataTypes.Vector3 = {
 	IsDynamic = false, ContainsInstances = false,
 	GetByteSize = function(_) return 12 end,
-	Write = function(TargetBuffer, CursorPosition, Value)
+	Write = function(TargetBuffer, CursorPosition, Value : Vector3)
 		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 12)
 		BufferWriteF32(TargetBuffer, CursorPosition, Value.X)
 		BufferWriteF32(TargetBuffer, CursorPosition + 4, Value.Y)
@@ -691,12 +691,12 @@ DataTypes.Vector3 = {
 		CheckBounds(TargetBuffer, CursorPosition, 12)
 		return Vector3.new(BufferReadF32(TargetBuffer, CursorPosition), BufferReadF32(TargetBuffer, CursorPosition + 4), BufferReadF32(TargetBuffer, CursorPosition + 8)), CursorPosition + 12
 	end
-}
+} :: TypeSerializer<Vector3>
 
 DataTypes.Vector3Int16 = {
 	IsDynamic = false, ContainsInstances = false,
 	GetByteSize = function(_) return 6 end,
-	Write = function(TargetBuffer, CursorPosition, Value)
+	Write = function(TargetBuffer, CursorPosition, Value : Vector3)
 		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 6)
 		BufferWriteI16(TargetBuffer, CursorPosition, MathClamp(MathRound(Value.X), -32768, 32767))
 		BufferWriteI16(TargetBuffer, CursorPosition + 2, MathClamp(MathRound(Value.Y), -32768, 32767))
@@ -707,12 +707,12 @@ DataTypes.Vector3Int16 = {
 		CheckBounds(TargetBuffer, CursorPosition, 6)
 		return Vector3.new(BufferReadI16(TargetBuffer, CursorPosition), BufferReadI16(TargetBuffer, CursorPosition + 2), BufferReadI16(TargetBuffer, CursorPosition + 4)), CursorPosition + 6
 	end
-}
+} :: TypeSerializer<Vector3>
 
 DataTypes.Vector2 = {
 	IsDynamic = false, ContainsInstances = false,
 	GetByteSize = function(_) return 8 end,
-	Write = function(TargetBuffer, CursorPosition, Value)
+	Write = function(TargetBuffer, CursorPosition, Value : Vector2)
 		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 8)
 		BufferWriteF32(TargetBuffer, CursorPosition, Value.X)
 		BufferWriteF32(TargetBuffer, CursorPosition + 4, Value.Y)
@@ -722,18 +722,17 @@ DataTypes.Vector2 = {
 		CheckBounds(TargetBuffer, CursorPosition, 8)
 		return Vector2.new(BufferReadF32(TargetBuffer, CursorPosition), BufferReadF32(TargetBuffer, CursorPosition + 4)), CursorPosition + 8
 	end
-}
+} :: TypeSerializer<Vector2>
 
 DataTypes.CFrameFloat16 = {
 	IsDynamic = false, ContainsInstances = false,
 	GetByteSize = function(_) return 12 end,
-	Write = function(TargetBuffer, CursorPosition, Value)
+	Write = function(TargetBuffer, CursorPosition, Value : CFrame)
 		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 12)
 		WriteFloat16(TargetBuffer, CursorPosition, Value.X)
 		WriteFloat16(TargetBuffer, CursorPosition + 2, Value.Y)
 		WriteFloat16(TargetBuffer, CursorPosition + 4, Value.Z)
 		local EulerX, EulerY, EulerZ = Value:ToEulerAnglesXYZ()
-		-- Sanitize Euler angles before scaling
 		local SafeEX = if EulerX == EulerX then EulerX else 0
 		local SafeEY = if EulerY == EulerY then EulerY else 0
 		local SafeEZ = if EulerZ == EulerZ then EulerZ else 0
@@ -750,15 +749,14 @@ DataTypes.CFrameFloat16 = {
 		local EZ = BufferReadI16(TargetBuffer, CursorPosition + 10) / EulerScalingFactor
 		return CFrame.fromEulerAnglesXYZ(EX, EY, EZ) + Vector3.new(PosX, PosY, PosZ), CursorPosition + 12
 	end
-}
+} :: TypeSerializer<CFrame>
 
 DataTypes.CFrame = {
 	IsDynamic = false, ContainsInstances = false,
 	GetByteSize = function(_) return 24 end,
-	Write = function(TargetBuffer, CursorPosition, Value)
+	Write = function(TargetBuffer, CursorPosition, Value : CFrame)
 		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 24)
 		local Axis, Angle = Value:ToAxisAngle()
-		-- Check ALL components for NaN
 		local HasNaN = Angle ~= Angle or Axis.X ~= Axis.X or Axis.Y ~= Axis.Y or Axis.Z ~= Axis.Z
 		local Rot = if HasNaN then Vector3.zero else Axis * Angle
 		BufferWriteF32(TargetBuffer, CursorPosition, Value.X)
@@ -777,12 +775,12 @@ DataTypes.CFrame = {
 		if Angle < 1e-6 then return CFrame.new(Pos), CursorPosition + 24 end
 		return CFrame.fromAxisAngle(Rot / Angle, Angle) + Pos, CursorPosition + 24
 	end
-}
+} :: TypeSerializer<CFrame>
 
 DataTypes.Color3 = {
 	IsDynamic = false, ContainsInstances = false,
 	GetByteSize = function(_) return 3 end,
-	Write = function(TargetBuffer, CursorPosition, Value)
+	Write = function(TargetBuffer, CursorPosition, Value : Color3)
 		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 3)
 		BufferWriteU8(TargetBuffer, CursorPosition, MathClamp(MathRound(Value.R * 255), 0, 255))
 		BufferWriteU8(TargetBuffer, CursorPosition + 1, MathClamp(MathRound(Value.G * 255), 0, 255))
@@ -793,12 +791,12 @@ DataTypes.Color3 = {
 		CheckBounds(TargetBuffer, CursorPosition, 3)
 		return Color3.fromRGB(BufferReadU8(TargetBuffer, CursorPosition), BufferReadU8(TargetBuffer, CursorPosition + 1), BufferReadU8(TargetBuffer, CursorPosition + 2)), CursorPosition + 3
 	end
-}
+} :: TypeSerializer<Color3>
 
 DataTypes.UDim2 = {
 	IsDynamic = false, ContainsInstances = false,
 	GetByteSize = function(_) return 16 end,
-	Write = function(TargetBuffer, CursorPosition, Value)
+	Write = function(TargetBuffer, CursorPosition, Value : UDim2)
 		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 16)
 		BufferWriteF32(TargetBuffer, CursorPosition, Value.X.Scale)
 		BufferWriteI32(TargetBuffer, CursorPosition + 4, Value.X.Offset)
@@ -810,12 +808,12 @@ DataTypes.UDim2 = {
 		CheckBounds(TargetBuffer, CursorPosition, 16)
 		return UDim2.new(BufferReadF32(TargetBuffer, CursorPosition), BufferReadI32(TargetBuffer, CursorPosition + 4), BufferReadF32(TargetBuffer, CursorPosition + 8), BufferReadI32(TargetBuffer, CursorPosition + 12)), CursorPosition + 16
 	end
-}
+} :: TypeSerializer<UDim2>
 
 DataTypes.DateTime = {
 	IsDynamic = false, ContainsInstances = false,
 	GetByteSize = function(_) return 8 end,
-	Write = function(TargetBuffer, CursorPosition, Value)
+	Write = function(TargetBuffer, CursorPosition, Value : DateTime)
 		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 8)
 		local High, Low = DecomposeInt64(Value.UnixTimestampMillis)
 		BufferWriteU32(TargetBuffer, CursorPosition, High)
@@ -827,7 +825,7 @@ DataTypes.DateTime = {
 		local High, Low = BufferReadU32(TargetBuffer, CursorPosition), BufferReadU32(TargetBuffer, CursorPosition + 4)
 		return DateTime.fromUnixTimestampMillis(High * 4294967296 + Low), CursorPosition + 8
 	end
-}
+} :: TypeSerializer<DateTime>
 
 DataTypes.Buffer = {
 	IsDynamic = true, ContainsInstances = false,
@@ -848,7 +846,7 @@ DataTypes.Buffer = {
 		BufferCopy(NewBuffer, 0, TargetBuffer, CursorPosition + 4, Length)
 		return NewBuffer, CursorPosition + 4 + Length
 	end
-}
+} :: TypeSerializer<buffer>
 
 DataTypes.Any = {
 	IsDynamic = true, ContainsInstances = true,
@@ -871,28 +869,28 @@ DataTypes.Any = {
 	Write = function(TargetBuffer, CursorPosition, Value, InstanceAccumulator, InstanceLookup)
 		local T = typeof(Value)
 		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 1)
-		
+
 		if Value == nil then BufferWriteU8(TargetBuffer, CursorPosition, 0) return TargetBuffer, CursorPosition + 1
-		elseif T == "boolean" then BufferWriteU8(TargetBuffer, CursorPosition, 1) return DataTypes.Boolean.Write(TargetBuffer, CursorPosition + 1, Value)
-		elseif T == "number" then BufferWriteU8(TargetBuffer, CursorPosition, 2) return DataTypes.Float64.Write(TargetBuffer, CursorPosition + 1, Value)
-		elseif T == "string" then BufferWriteU8(TargetBuffer, CursorPosition, 3) return DataTypes.String.Write(TargetBuffer, CursorPosition + 1, Value)
-		elseif T == "Instance" then BufferWriteU8(TargetBuffer, CursorPosition, 4) return DataTypes.Instance.Write(TargetBuffer, CursorPosition + 1, Value, InstanceAccumulator, InstanceLookup)
-		elseif T == "Vector3" then BufferWriteU8(TargetBuffer, CursorPosition, 5) return DataTypes.Vector3.Write(TargetBuffer, CursorPosition + 1, Value)
+		elseif T == "boolean" then BufferWriteU8(TargetBuffer, CursorPosition, 1) return DataTypes.Boolean.Write(TargetBuffer, CursorPosition + 1, Value :: boolean, InstanceAccumulator, InstanceLookup)
+		elseif T == "number" then BufferWriteU8(TargetBuffer, CursorPosition, 2) return DataTypes.Float64.Write(TargetBuffer, CursorPosition + 1, Value :: number, InstanceAccumulator, InstanceLookup)
+		elseif T == "string" then BufferWriteU8(TargetBuffer, CursorPosition, 3) return DataTypes.String.Write(TargetBuffer, CursorPosition + 1, Value :: string, InstanceAccumulator, InstanceLookup)
+		elseif T == "Instance" then BufferWriteU8(TargetBuffer, CursorPosition, 4) return DataTypes.Instance.Write(TargetBuffer, CursorPosition + 1, Value :: Instance, InstanceAccumulator, InstanceLookup)
+		elseif T == "Vector3" then BufferWriteU8(TargetBuffer, CursorPosition, 5) return DataTypes.Vector3.Write(TargetBuffer, CursorPosition + 1, Value :: Vector3, InstanceAccumulator, InstanceLookup)
 		elseif T == "EnumItem" then
 			BufferWriteU8(TargetBuffer, CursorPosition, 6)
-			TargetBuffer, CursorPosition = DataTypes.String.Write(TargetBuffer, CursorPosition + 1, tostring(Value.EnumType))
+			TargetBuffer, CursorPosition = DataTypes.String.Write(TargetBuffer, CursorPosition + 1, tostring((Value :: EnumItem).EnumType), InstanceAccumulator, InstanceLookup)
 			TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 2)
-			BufferWriteU16(TargetBuffer, CursorPosition, Value.Value)
+			BufferWriteU16(TargetBuffer, CursorPosition, (Value :: EnumItem).Value)
 			return TargetBuffer, CursorPosition + 2
-		elseif T == "CFrame" then BufferWriteU8(TargetBuffer, CursorPosition, 7) return DataTypes.CFrame.Write(TargetBuffer, CursorPosition + 1, Value)
-		elseif T == "Vector2" then BufferWriteU8(TargetBuffer, CursorPosition, 8) return DataTypes.Vector2.Write(TargetBuffer, CursorPosition + 1, Value)
-		elseif T == "Color3" then BufferWriteU8(TargetBuffer, CursorPosition, 9) return DataTypes.Color3.Write(TargetBuffer, CursorPosition + 1, Value)
-		elseif T == "UDim2" then BufferWriteU8(TargetBuffer, CursorPosition, 10) return DataTypes.UDim2.Write(TargetBuffer, CursorPosition + 1, Value)
-		elseif T == "DateTime" then BufferWriteU8(TargetBuffer, CursorPosition, 11) return DataTypes.DateTime.Write(TargetBuffer, CursorPosition + 1, Value)
-		elseif T == "buffer" then BufferWriteU8(TargetBuffer, CursorPosition, 12) return DataTypes.Buffer.Write(TargetBuffer, CursorPosition + 1, Value)
+		elseif T == "CFrame" then BufferWriteU8(TargetBuffer, CursorPosition, 7) return DataTypes.CFrame.Write(TargetBuffer, CursorPosition + 1, Value :: CFrame, InstanceAccumulator, InstanceLookup)
+		elseif T == "Vector2" then BufferWriteU8(TargetBuffer, CursorPosition, 8) return DataTypes.Vector2.Write(TargetBuffer, CursorPosition + 1, Value :: Vector2, InstanceAccumulator, InstanceLookup)
+		elseif T == "Color3" then BufferWriteU8(TargetBuffer, CursorPosition, 9) return DataTypes.Color3.Write(TargetBuffer, CursorPosition + 1, Value :: Color3, InstanceAccumulator, InstanceLookup)
+		elseif T == "UDim2" then BufferWriteU8(TargetBuffer, CursorPosition, 10) return DataTypes.UDim2.Write(TargetBuffer, CursorPosition + 1, Value :: UDim2, InstanceAccumulator, InstanceLookup)
+		elseif T == "DateTime" then BufferWriteU8(TargetBuffer, CursorPosition, 11) return DataTypes.DateTime.Write(TargetBuffer, CursorPosition + 1, Value :: DateTime, InstanceAccumulator, InstanceLookup)
+		elseif T == "buffer" then BufferWriteU8(TargetBuffer, CursorPosition, 12) return DataTypes.Buffer.Write(TargetBuffer, CursorPosition + 1, Value :: buffer, InstanceAccumulator, InstanceLookup)
 		else error(string.format("[%s] Unsupported Any type: %s", IonErrorCodes.NOT_SUPPORTED, T)) end
 	end,
-	Read = function(TargetBuffer, CursorPosition, InstanceSource)
+	Read = function(TargetBuffer, CursorPosition, InstanceSource) : (any, number)
 		CheckBounds(TargetBuffer, CursorPosition, 1)
 		local Id = BufferReadU8(TargetBuffer, CursorPosition)
 		CursorPosition += 1
@@ -937,7 +935,7 @@ DataTypes.Any = {
 		elseif Id == 12 then return DataTypes.Buffer.Read(TargetBuffer, CursorPosition, InstanceSource)
 		else error(string.format("[%s] Unknown Any Type ID: %d", IonErrorCodes.SERIALIZATION_FAILED, Id)) end
 	end
-}
+} :: TypeSerializer<any>
 
 function DataTypes.Array<T>(Inner : TypeSerializer<T>) : TypeSerializer<{ T }>
 	if Inner.IsUnbounded then error("Ion: RestOfString cannot be used inside Array") end
@@ -948,7 +946,7 @@ function DataTypes.Array<T>(Inner : TypeSerializer<T>) : TypeSerializer<{ T }>
 			if Count > MaxCollectionSize then 
 				error(string.format("[%s] Array size %d exceeds limit", IonErrorCodes.SIZE_LIMIT_EXCEEDED, Count))
 			end
-			
+
 			if not Inner.IsDynamic then return 4 + (Count * Inner.GetByteSize(nil :: any)) end
 			local Size = 4
 			for _, Item in ipairs(Value) do 
@@ -959,9 +957,8 @@ function DataTypes.Array<T>(Inner : TypeSerializer<T>) : TypeSerializer<{ T }>
 		end,
 		Write = function(TargetBuffer, CursorPosition, Value, InstanceAccumulator, InstanceLookup)
 			local Count = #Value
-			-- Check size BEFORE iteration
 			if Count > MaxCollectionSize then error(string.format("[%s] Array size %d exceeds limit", IonErrorCodes.SIZE_LIMIT_EXCEEDED, Count)) end
-			
+
 			TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 4)
 			BufferWriteU32(TargetBuffer, CursorPosition, Count)
 			CursorPosition += 4
@@ -1003,9 +1000,8 @@ function DataTypes.Map<K, V>(KeyType : TypeSerializer<K>, ValType : TypeSerializ
 		Write = function(TargetBuffer, CursorPosition, Value, InstanceAccumulator, InstanceLookup)
 			local Count = 0
 			for _ in pairs(Value) do Count += 1 end
-			-- Check size BEFORE iteration
 			if Count > MaxCollectionSize then error(string.format("[%s] Map size %d exceeds limit", IonErrorCodes.SIZE_LIMIT_EXCEEDED, Count)) end
-			
+
 			TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 4)
 			BufferWriteU32(TargetBuffer, CursorPosition, Count)
 			CursorPosition += 4
@@ -1032,7 +1028,7 @@ function DataTypes.Map<K, V>(KeyType : TypeSerializer<K>, ValType : TypeSerializ
 	}
 end
 
-function DataTypes.Struct(StructureDefinition)
+function DataTypes.Struct(StructureDefinition : { [string]: TypeSerializer<any> }): TypeSerializer<{ [string]: any }>
 	local SortedKeys = {}
 	local HasInstances, IsDynamic = false, false
 	for Key, Serializer in pairs(StructureDefinition) do 
@@ -1042,18 +1038,19 @@ function DataTypes.Struct(StructureDefinition)
 		if Serializer.IsDynamic then IsDynamic = true end
 	end
 	table.sort(SortedKeys)
-	local Writers, Readers = {}, {}
+	local Writers: {(buffer, number, any, {Instance}, {[Instance]: number}) -> (buffer, number)} = {}
+	local Readers: {(buffer, number, {Instance}) -> (any, number)} = {}
+
 	for Index, Key in ipairs(SortedKeys) do
 		Writers[Index] = StructureDefinition[Key].Write
 		Readers[Index] = StructureDefinition[Key].Read
 	end
-	
+
 	return {
 		IsDynamic = IsDynamic, ContainsInstances = HasInstances,
 		GetByteSize = function(Value) 
 			local Size = 0 
 			for _, Key in ipairs(SortedKeys) do 
-				-- Check for nil values in Struct keys to prevent silent errors
 				local Val = Value[Key]
 				if Val == nil and not IsDynamic then
 					warn(string.format("Ion: Struct field '%s' is nil - will use default value", Key))
@@ -1062,14 +1059,14 @@ function DataTypes.Struct(StructureDefinition)
 			end 
 			return Size 
 		end,
-		Write = function(TargetBuffer, CursorPosition, Value, InstanceAccumulator, InstanceLookup)
+		Write = function(TargetBuffer: buffer, CursorPosition: number, Value: { [string]: any }, InstanceAccumulator: {Instance}, InstanceLookup: {[Instance]: number}): (buffer, number)
 			for Index = 1, #SortedKeys do 
 				TargetBuffer, CursorPosition = Writers[Index](TargetBuffer, CursorPosition, Value[SortedKeys[Index]], InstanceAccumulator, InstanceLookup) 
 			end
 			return TargetBuffer, CursorPosition
 		end,
-		Read = function(TargetBuffer, CursorPosition, InstanceSource)
-			local Result = {}
+		Read = function(TargetBuffer: buffer, CursorPosition: number, InstanceSource: {Instance}): ({ [string]: any }, number)
+			local Result: { [string]: any } = {}
 			for Index = 1, #SortedKeys do 
 				Result[SortedKeys[Index]], CursorPosition = Readers[Index](TargetBuffer, CursorPosition, InstanceSource) 
 			end
@@ -1085,23 +1082,21 @@ end
 local Ion = {}
 Ion.Types = DataTypes
 
-local function PreparePacket(Schema, Args, Hash, SchemaVersion, UseCompression, CompressThreshold)
+local function PreparePacket(Schema: { TypeSerializer<any> }, Args: { any }, Hash: number, SchemaVersion: number, UseCompression: boolean, CompressThreshold: number): (buffer?, { Instance }?, string?)
 	local PayloadBuf = AcquireBuffer(1024)
-	
-	-- pcall now wraps compression too
+
 	local Success, Result = pcall(function()
 		local Cursor, Acc, Look = 0, {}, {}
 		for Index, Serializer in ipairs(Schema) do 
 			PayloadBuf, Cursor = Serializer.Write(PayloadBuf, Cursor, Args[Index], Acc, Look) 
 		end
-		
+
 		local FinalSize = Cursor
 		local FinalPayload = BufferCreate(FinalSize)
 		BufferCopy(FinalPayload, 0, PayloadBuf, 0, FinalSize)
-		
+
 		local IsCompressed = false
 		if UseCompression and FinalSize > CompressThreshold then
-			-- Compression is now inside the pcall
 			local CompData = EncodingService:CompressBuffer(FinalPayload, Enum.CompressionAlgorithm.Zstd)
 			if BufferLen(CompData) < FinalSize then
 				FinalPayload = CompData
@@ -1109,16 +1104,16 @@ local function PreparePacket(Schema, Args, Hash, SchemaVersion, UseCompression, 
 				PerformanceStats.CompressionSavings += (FinalSize - BufferLen(CompData))
 			end
 		end
-		
+
 		return { Payload = FinalPayload, Compressed = IsCompressed, Inst = Acc }
 	end)
 
-	ReleaseBuffer(PayloadBuf) -- Always release the temp buffer
+	ReleaseBuffer(PayloadBuf)
 
 	if not Success then 
 		return nil, nil, "Serialization Failed: " .. tostring(Result)
 	end
-	
+
 	local PacketData = Result
 	local Header = BufferCreate(7 + BufferLen(PacketData.Payload))
 	BufferWriteU8(Header, 0, IonVersion)
@@ -1126,7 +1121,7 @@ local function PreparePacket(Schema, Args, Hash, SchemaVersion, UseCompression, 
 	BufferWriteU8(Header, 5, PacketData.Compressed and 1 or 0)
 	BufferWriteU8(Header, 6, SchemaVersion)
 	BufferCopy(Header, 7, PacketData.Payload, 0, BufferLen(PacketData.Payload))
-	
+
 	return Header, PacketData.Inst, nil
 end
 
@@ -1135,7 +1130,7 @@ local function GetStubPacket()
 		Server = {
 			SendTo = function(...) return false end,
 			SendToAll = function(...) return false end,
-			SendToList = function(R) return R end,
+			SendToList = function(R: { Player }, ...: any): { Player } return R end,
 			Listen = function(...) end
 		},
 		Client = {
@@ -1146,23 +1141,23 @@ local function GetStubPacket()
 	}
 end
 
-function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Options : IonDefinitionOptions?)
+function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Options : IonDefinitionOptions?): IonPacket<...any>
 	local Success, Result = pcall(function()
-		if Namespace == nil or Namespace == "" or #Namespace == 0 then
+		if (Namespace :: any) == nil or Namespace == "" or #Namespace == 0 then
 			error(string.format("[%s] Namespace cannot be empty", IonErrorCodes.INVALID_CONFIG))
 		end
-		-- Handle empty namespace after trim
+
 		local TrimmedNamespace = Namespace:match("^%s*(.-)%s*$")
-		if Namespace ~= TrimmedNamespace then
+		if TrimmedNamespace and Namespace ~= TrimmedNamespace then
 			warn("Ion: Namespace has leading/trailing whitespace - trimming")
 			Namespace = TrimmedNamespace or ""
 		end
-		if Namespace == "" then
+		if (Namespace :: any) == "" then
 			error(string.format("[%s] Namespace cannot be empty after trimming", IonErrorCodes.INVALID_CONFIG))
 		end
 
 		local Hash = FNV1a(Namespace)
-		
+
 		if Definitions[Hash] then
 			local Existing = ActivePackets[Hash]
 			if Existing and Existing.Namespace == Namespace then
@@ -1173,18 +1168,16 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 					Namespace,
 					Existing and Existing.Namespace or "unknown",
 					Hash
-				))
+					))
 			end
 		end
-		
-		-- RestOfString validation
+
 		for Index = 1, #Schema - 1 do
 			if Schema[Index].IsUnbounded then
 				error("Ion: RestOfString can only be the last field in schema")
 			end
 		end
-		
-		-- Validate SchemaVersion is integer
+
 		local SchemaVersion = Options and Options.SchemaVersion or 1
 		if type(SchemaVersion) ~= "number" or SchemaVersion ~= math.floor(SchemaVersion) then
 			error(string.format("[%s] SchemaVersion must be an integer", IonErrorCodes.INVALID_CONFIG))
@@ -1192,17 +1185,14 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 		if SchemaVersion < 0 or SchemaVersion > 255 then
 			error(string.format("[%s] SchemaVersion must be 0-255", IonErrorCodes.INVALID_CONFIG))
 		end
-		
-		-- Configurable Timeout
+
 		local RemoteTimeout = Options and Options.RemoteTimeout or 10
-		
-		-- Rate Limiter Setup
 		local RateLimitConfig = Options and Options.RateLimit
 		local RateLimitState = if RateLimitConfig then {
 			History = {},
 			WindowStart = 0
 		} else nil
-		
+
 		Definitions[Hash] = Schema
 		ActivePackets[Hash] = { 
 			Namespace = Namespace, 
@@ -1212,7 +1202,7 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 			ClientRateLimitState = RateLimitState,
 			ServerRateLimitState = {}
 		}
-		
+
 		local IsUnreliable = Options and Options.Unreliable or false
 		local UseCompression = Options and Options.Compress or false
 		local CompressThreshold = Options and Options.CompressionThreshold or CompressionThreshold
@@ -1220,52 +1210,50 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 		local RemoteName = "Ion_".. Hash
 
 		local function OnEvent(Player : Player | buffer, Data : buffer | {Instance}?, Instances : {Instance}?)
-			-- Initial destroyed check
 			local PacketData = ActivePackets[Hash]
 			if not PacketData or PacketData.IsDestroyed then return end
-			
+
 			local SourceBuffer = if RunService:IsServer() then Data :: buffer else Player :: buffer
 			local SourceInstances = if RunService:IsServer() then Instances :: {Instance} else Data :: {Instance}
 			local CursorPosition = 0
 			local StartTime = os.clock()
-			
-			-- Server-Side Receive Rate Limiting (Prevent Client Spam)
+
 			if RunService:IsServer() and RateLimitConfig then
 				local Sender = Player :: Player
 				local UserId = Sender.UserId
-				
-				-- Init server state for player if missing
+
 				if not PacketData.ServerRateLimitState then PacketData.ServerRateLimitState = {} end
 				local ServerState = PacketData.ServerRateLimitState
+				if not ServerState then return end
+
 				local PlayerState = ServerState[UserId]
-				
+
 				if not PlayerState then
 					PlayerState = { History = {}, WindowStart = 0 }
 					ServerState[UserId] = PlayerState
 				end
-				
+
 				local Now = os.clock()
 				if Now - PlayerState.WindowStart > RateLimitConfig.Window then
 					PlayerState.History = {}
 					PlayerState.WindowStart = Now
 				end
-				
+
 				local Cutoff = Now - RateLimitConfig.Window
-				for i = #PlayerState.History, 1, -1 do
-					if PlayerState.History[i] < Cutoff then
-						table.remove(PlayerState.History, i)
+				for Index = #PlayerState.History, 1, -1 do
+					if PlayerState.History[Index] < Cutoff then
+						table.remove(PlayerState.History, Index)
 					end
 				end
-				
+
 				if #PlayerState.History >= RateLimitConfig.MaxRequests then
 					warn(string.format("[%s] Rate limit exceeded from player %d", IonErrorCodes.RATE_LIMITED, UserId))
-					return -- Drop packet
+					return
 				end
-				
+
 				table.insert(PlayerState.History, Now)
 			end
 
-			-- Capture success, result, AND message
 			local Success, ErrorOrMessage = pcall(function()
 				CheckBounds(SourceBuffer, CursorPosition, 7)
 				local Ver = BufferReadU8(SourceBuffer, CursorPosition)
@@ -1273,25 +1261,25 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 				local Flg = BufferReadU8(SourceBuffer, CursorPosition + 5)
 				local SVer = BufferReadU8(SourceBuffer, CursorPosition + 6)
 				CursorPosition += 7
-				
+
 				if Ver ~= IonVersion then error(string.format("[%s] Version mismatch", IonErrorCodes.VERSION_MISMATCH)) end
 				if PId ~= Hash then error(string.format("[%s] Packet ID mismatch", IonErrorCodes.PACKET_ID_MISMATCH)) end
 				if SVer ~= SchemaVersion then error(string.format("[%s] Schema mismatch", IonErrorCodes.SCHEMA_MISMATCH)) end
-				
+
 				if Bit32Band(Flg, 1) == 1 then
 					local CompSize = BufferLen(SourceBuffer) - 7
 					if CompSize > MaxBufferSize then error(string.format("[%s] Compressed payload too large", IonErrorCodes.SIZE_LIMIT_EXCEEDED)) end
 					local CompPayload = BufferCreate(CompSize)
 					BufferCopy(CompPayload, 0, SourceBuffer, 7, CompSize)
-					
-					local DecompSuccess, DecompResult = pcall(EncodingService.DecompressBuffer, EncodingService, CompPayload, Enum.CompressionAlgorithm.Zstd)
-					-- Added correct error code for decompression failure
+
+					local DecompSuccess, DecompResult = pcall(function() return EncodingService:DecompressBuffer(CompPayload, Enum.CompressionAlgorithm.Zstd) end)
 					if not DecompSuccess then error(string.format("[%s] Decompression failed: %s", IonErrorCodes.DECOMPRESSION_FAILED, tostring(DecompResult))) end
-					
-					SourceBuffer = DecompResult
+
+					SourceBuffer = DecompResult :: buffer
 					CursorPosition = 0
 					if BufferLen(SourceBuffer) > MaxBufferSize then error(string.format("[%s] Decompressed payload too large", IonErrorCodes.SIZE_LIMIT_EXCEEDED)) end
 				end
+				return true
 			end)
 
 			if not Success then 
@@ -1299,7 +1287,6 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 				return 
 			end
 
-			-- Double check destruction before callback
 			if ActivePackets[Hash].IsDestroyed then return end
 
 			local Callback = Listeners[Hash]
@@ -1311,27 +1298,28 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 						table.insert(Args, Val)
 						CursorPosition = Next
 					end
+					return true
 				end)
-				
+
 				if not ReadSuccess then warn("Ion Read Error: "..tostring(ReadErr)) return end
-				
+
 				RecordPerformance("deserialize", os.clock() - StartTime, BufferLen(SourceBuffer))
-				
+
 				if Hooks and Hooks.OnAfterReceived then
-					-- Middleware error handling
+					local OnAfterReceived = Hooks.OnAfterReceived
 					local MiddlewareSuccess, MiddlewareErr = pcall(function()
 						if RunService:IsServer() then
-							Hooks.OnAfterReceived(Player, table.unpack(Args))
+							OnAfterReceived(Player, table.unpack(Args))
 						else
-							Hooks.OnAfterReceived(table.unpack(Args))
+							OnAfterReceived(table.unpack(Args))
 						end
+						return true
 					end)
 					if not MiddlewareSuccess then warn("Ion Middleware Error: " .. tostring(MiddlewareErr)) end
 				end
-				
-				-- Final race condition check
+
 				if ActivePackets[Hash].IsDestroyed then return end
-				
+
 				if RunService:IsServer() then Callback(Player, table.unpack(Args)) else Callback(table.unpack(Args)) end
 			end
 		end
@@ -1339,47 +1327,43 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 		if RunService:IsServer() then
 			local Remote = if IsUnreliable then Instance.new("UnreliableRemoteEvent") else Instance.new("RemoteEvent")
 			Remote.Name, Remote.Parent = RemoteName, ReplicatedStorage
-			RemoteCache[Hash] = Remote
+			RemoteCache[Hash] = Remote :: any
 			RemoteConnections[Hash] = (Remote :: any).OnServerEvent:Connect(OnEvent)
 		else
 			local Remote = ReplicatedStorage:WaitForChild(RemoteName, RemoteTimeout)
 			if not Remote then
-				-- Fallback polling if WaitForChild times out (rare but possible with streaming)
 				local Retries = 0
 				while not Remote and Retries < 5 do
 					Retries += 1
 					Remote = ReplicatedStorage:WaitForChild(RemoteName, 2)
 				end
 			end
-			-- Safer client error - return stub instead of crashing
 			if not Remote then 
 				warn(string.format("[%s] Remote missing for %s - packet will be non-functional", IonErrorCodes.REMOTE_MISSING, Namespace))
 				return GetStubPacket()
 			end
-			RemoteCache[Hash] = Remote
+			RemoteCache[Hash] = Remote :: any
 			RemoteConnections[Hash] = (Remote :: any).OnClientEvent:Connect(OnEvent)
 		end
 
 		local PacketObject = {}
-		
+
 		function PacketObject.Send(Target : Player?, ... : any) : boolean
 			local PacketData = ActivePackets[Hash]
 			if not PacketData or PacketData.IsDestroyed then return false end
-			
+
 			if not Definitions[Hash] then return false end
 			local Remote : any = RemoteCache[Hash]
 			if not Remote or not Remote.Parent then return false end
 
 			local Args = table.pack(...)
-			-- Explicit Middleware Handling
 			if Hooks and Hooks.OnBeforeSend then
 				local MiddlewareSuccess, MiddlewareResult = pcall(Hooks.OnBeforeSend, ...)
 				if not MiddlewareSuccess then 
 					warn("Ion Middleware Error: " .. tostring(MiddlewareResult)) 
 					return false 
 				end
-				
-				-- Strict return type handling
+
 				if MiddlewareResult == false then 
 					return false 
 				elseif type(MiddlewareResult) == "table" then 
@@ -1388,29 +1372,28 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 					warn(string.format("Ion: OnBeforeSend returned unexpected type '%s' - ignoring", type(MiddlewareResult)))
 				end
 			end
-			
-			-- Client-Side / Outgoing Rate Limiting
+
 			if RateLimitConfig and PacketData.ClientRateLimitState then
 				local Now = os.clock()
 				local State = PacketData.ClientRateLimitState
-				
+
 				if Now - State.WindowStart > RateLimitConfig.Window then
 					State.History = {}
 					State.WindowStart = Now
 				end
-				
+
 				local Cutoff = Now - RateLimitConfig.Window
 				for i = #State.History, 1, -1 do
 					if State.History[i] < Cutoff then
 						table.remove(State.History, i)
 					end
 				end
-				
+
 				if #State.History >= RateLimitConfig.MaxRequests then
 					warn(string.format("[%s] Rate limit exceeded for %s", IonErrorCodes.RATE_LIMITED, Namespace))
 					return false
 				end
-				
+
 				table.insert(State.History, Now)
 			end
 
@@ -1420,43 +1403,41 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 				local SizeCheckSuccess = pcall(function() 
 					for Index, Serializer in ipairs(Schema) do 
 						EstSize += Serializer.GetByteSize(Args[Index])
-						-- Better estimation including instance overhead
 						if Serializer.ContainsInstances then
 							InstanceCount += 1
 						end
 					end 
-					EstSize += InstanceCount * 10 -- Approx 10 bytes overhead per instance ref
+					EstSize += InstanceCount * 10
 				end)
-				
+
 				if not SizeCheckSuccess then 
 					warn("Ion: Size check failed - aborting send") 
 					return false 
 				end
-				
+
 				if UseCompression and EstSize > CompressThreshold then 
 					EstSize = math.ceil(EstSize * CompressionRatioEstimate) 
 				end
-				
-				-- Strict enforcement of packet size for unreliable packets
+
 				if EstSize > MaxPacketSize then 
 					warn(string.format("[%s] Packet likely too large (%d bytes)", IonErrorCodes.SIZE_LIMIT_EXCEEDED, EstSize))
 					return false 
 				end
 			end
-			
+
 			local StartTime = os.clock()
 			local PacketBuffer, PacketInsts, Err = PreparePacket(Schema, Args, Hash, SchemaVersion, UseCompression, CompressThreshold)
 			if not PacketBuffer then warn(Err) return false end
-			
+
 			if IsUnreliable and BufferLen(PacketBuffer) > MaxPacketSize then 
 				warn(string.format("[%s] Packet too large (%d bytes)", IonErrorCodes.SIZE_LIMIT_EXCEEDED, BufferLen(PacketBuffer)))
 				return false 
 			end
-			
+
 			RecordPerformance("serialize", os.clock() - StartTime, BufferLen(PacketBuffer))
-			
+
 			DebugLog("Sent Packet "..Namespace, "DEBUG")
-			
+
 			if RunService:IsServer() then
 				if Target then Remote:FireClient(Target, PacketBuffer, PacketInsts) else Remote:FireAllClients(PacketBuffer, PacketInsts) end
 			else
@@ -1465,80 +1446,75 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 			return true
 		end
 
-		function PacketObject.SendToList(Recipients, ...)
+		function PacketObject.SendToList(Recipients: { Player }, ...: any): { Player }
 			if type(Recipients) ~= "table" then
 				warn("Ion: SendToList recipients must be a table")
 				return {}
 			end
 			if #Recipients == 0 then return {} end
-			
-			-- NOTE: SendToList calls OnBeforeSend once for all recipients.
-			-- The middleware does NOT receive individual Player context.
+
 			local Args = table.pack(...)
-			
-			-- SendToList middleware context limitation check
 			if Hooks and Hooks.OnBeforeSend then
 				local MiddlewareSuccess, MiddlewareResult = pcall(Hooks.OnBeforeSend, ...)
 				if not MiddlewareSuccess then 
 					warn("Ion Middleware Error: " .. tostring(MiddlewareResult)) 
 					return Recipients 
 				end
-				
+
 				if MiddlewareResult == false then 
 					return Recipients 
 				elseif type(MiddlewareResult) == "table" then 
 					Args = MiddlewareResult 
 				end
 			end
-			
+
 			local PacketBuffer, PacketInsts, Err = PreparePacket(Schema, Args, Hash, SchemaVersion, UseCompression, CompressThreshold)
 			if not PacketBuffer then warn(Err) return Recipients end
-			
+
 			if IsUnreliable and BufferLen(PacketBuffer) > MaxPacketSize then return Recipients end
-			
-			local Failed = {}
+
+			local Failed: { Player } = {}
 			local Remote : any = RemoteCache[Hash]
-			for _, Plr in ipairs(Recipients) do
-				-- Wrap FireClient in pcall
-				if Plr and Plr.Parent then 
+			for _, Player in ipairs(Recipients) do
+				if Player and Player.Parent then 
 					local SendSuccess = pcall(function()
-						Remote:FireClient(Plr, PacketBuffer, PacketInsts) 
+						Remote:FireClient(Player, PacketBuffer, PacketInsts) 
 					end)
 					if not SendSuccess then
-						DebugLog("SendToList failed for player: " .. tostring(Plr), "WARN")
-						table.insert(Failed, Plr)
+						DebugLog("SendToList failed for player: " .. tostring(Player), "WARN")
+						table.insert(Failed, Player)
 					end
 				else 
-					table.insert(Failed, Plr) 
+					table.insert(Failed, Player :: Player) 
 				end
 			end
 			return Failed
 		end
 
 		function PacketObject.Listen(Callback) Listeners[Hash] = Callback end
-		
+
 		function PacketObject.Destroy()
 			local PacketData = ActivePackets[Hash]
 			if not PacketData or PacketData.IsDestroyed then return end
-			
+
 			DebugLog("Destroying Packet "..Namespace, "INFO")
 			PacketData.IsDestroyed = true
-			
+
 			Listeners[Hash] = nil
-			local Conn = RemoteConnections[Hash]
-			if Conn then Conn:Disconnect() end
+			local Connection = RemoteConnections[Hash]
+			if Connection then Connection:Disconnect() end
 			RemoteConnections[Hash] = nil
-			
+
 			local Remote = RemoteCache[Hash]
 			if Remote and typeof(Remote) == "Instance" and Remote.Parent then Remote:Destroy() end
-			
+
 			RemoteCache[Hash] = nil
 			Definitions[Hash] = nil
 			ActivePackets[Hash] = nil
 		end
 
 		return {
-			Server = { SendTo = function(p,...) return PacketObject.Send(p,...) end, SendToAll = function(...) return PacketObject.Send(nil,...) end, SendToList = PacketObject.SendToList, Listen = PacketObject.Listen },
+			Server = { SendTo = function(Player,...) return PacketObject.Send(Player,...) end, SendToAll = function(...) return PacketObject.Send(nil,...) end, SendToList = PacketObject.SendToList, Listen = PacketObject.Listen },
 			Client = { Send = function(...) return PacketObject.Send(nil,...) end, Listen = PacketObject.Listen },
 			Destroy = PacketObject.Destroy
 		}
