@@ -97,26 +97,26 @@ local IonErrorCodes = {
 -- PUBLIC TYPE EXPORTS
 --------------------------------------------------------------------------------
 
-export type IonPacket<T...> = {
+export type IonPacket<Arguments...> = {
 	Server : {
-		SendTo : (Recipient : Player, T...) -> (boolean),
-		SendToAll : (T...) -> (boolean),
-		SendToList : (Recipients : { Player }, T...) -> ({ Player }),
-		Listen : (Callback : (Player, T...) -> ()) -> ()
+		SendTo : (Recipient : Player, Arguments...) -> (boolean),
+		SendToAll : (Arguments...) -> (boolean),
+		SendToList : (Recipients : { Player }, Arguments...) -> ({ Player }),
+		Listen : (Callback : (Player, Arguments...) -> ()) -> ()
 	},
 	Client : {
-		Send : (T...) -> (boolean),
-		Listen : (Callback : (T...) -> ()) -> ()
+		Send : (Arguments...) -> (boolean),
+		Listen : (Callback : (Arguments...) -> ()) -> ()
 	},
 	Destroy : () -> ()
 }
 
 export type Int64Struct = { Upper : number, Lower : number }
 
-export type TypeSerializer<T> = {
-	Write : (buffer, number, T, { Instance }, { [Instance] : number }) -> (buffer, number),
-	Read : (buffer, number, { Instance }) -> (T, number),
-	GetByteSize : (T) -> number,
+export type TypeSerializer<Type> = {
+	Write : (buffer, number, Type, { Instance }, { [Instance] : number }) -> (buffer, number),
+	Read : (buffer, number, { Instance }) -> (Type, number),
+	GetByteSize : (Type) -> number,
 	IsDynamic : boolean,
 	ContainsInstances : boolean,
 	IsUnbounded : boolean?
@@ -149,15 +149,20 @@ local AnyEnumCache : { [any] : { [number] : EnumItem } } = {}
 local AnyEnumCacheOrder : { any } = {}
 
 -- Packet Tracking
+type RateLimitState = {
+	History : { number },
+	WindowStart : number
+}
+
 type PacketMetadata = {
 	Namespace : string,
 	Created : number,
 	IsDestroyed : boolean,
 	Generation : number,
-	RateLimitState : {
-		History : { number },
-		WindowStart : number
-	}?
+	-- Client-side sending limit (used on Client and Server for outgoing)
+	ClientRateLimitState : RateLimitState?,
+	-- Server-side receiving limit (UserId -> State)
+	ServerRateLimitState : { [number] : RateLimitState }?
 }
 
 local Definitions : { [number] : any } = {}
@@ -165,7 +170,6 @@ local Listeners : { [number] : (...any) -> () } = {}
 local RemoteCache : { [number] : RemoteEvent | UnreliableRemoteEvent } = {}
 local RemoteConnections : { [number] : RBXScriptConnection } = {}
 local ActivePackets : { [number] : PacketMetadata } = {}
-local HashGenerations : { [number] : number } = {}
 
 local DebugMode = false
 local DebugLogger : ((message: string, level: string) -> ())? = nil
@@ -221,10 +225,13 @@ end
 
 local function ReleaseBuffer(BufferToRelease : buffer)
 	local CurrentLength = BufferLen(BufferToRelease)
+	-- Only pool exact matches to standard size to prevent memory fragmentation
 	if CurrentLength == PoolBufferSize and #BufferPool < PoolCapacity then
+		-- Security: Wipe data before pooling to prevent info leaks
 		BufferFill(BufferToRelease, 0, 0, PoolBufferSize)
 		table.insert(BufferPool, BufferToRelease)
 	end
+	-- Oversized/Undersized buffers are left to GC
 end
 
 local function AcquireBuffer(MinimumSize : number) : buffer
@@ -263,6 +270,7 @@ local function EnsureCapacity(TargetBuffer : buffer, CursorPosition : number, Si
 	local NewBuffer = BufferCreate(NewLength)
 	BufferCopy(NewBuffer, 0, TargetBuffer, 0, CurrentLength)
 	
+	-- Always release the old buffer (ReleaseBuffer handles validation)
 	ReleaseBuffer(TargetBuffer)
 	
 	return NewBuffer
@@ -283,7 +291,8 @@ local function FNV1a(StringValue : string) : number
 	local Prime : number = 16777619
 	for Index = 1, #StringValue do
 		Hash = Bit32Xor(Hash, string.byte(StringValue, Index))
-		Hash = Bit32Band(Hash, 4294967295) -- Ensure 32-bit before multiply
+		-- Ensure 32-bit clamping before multiplication to minimize overflow
+		Hash = Bit32Band(Hash, 4294967295) 
 		Hash = Bit32Band(Hash * Prime, 4294967295)
 	end
 	return Hash
@@ -296,7 +305,7 @@ local function WriteFloat16(TargetBuffer : buffer, CursorPosition : number, Valu
 	
 	if Value == 0 then
 		Encoded = Sign
-	elseif Value > 65504 then
+	elseif Value > 65504 then -- Value > MaxFloat16
 		Encoded = Sign + 0x7C00
 	elseif Value ~= Value then -- NaN
 		Encoded = 0x7FFF
@@ -398,10 +407,10 @@ DataTypes.UInt24 = {
 	end,
 	Read = function(TargetBuffer, CursorPosition) 
 		CheckBounds(TargetBuffer, CursorPosition, 3)
-		local B1 = BufferReadU8(TargetBuffer, CursorPosition)
-		local B2 = BufferReadU8(TargetBuffer, CursorPosition + 1)
-		local B3 = BufferReadU8(TargetBuffer, CursorPosition + 2)
-		return B1 + Bit32LShift(B2, 8) + Bit32LShift(B3, 16), CursorPosition + 3 
+		local Byte1 = BufferReadU8(TargetBuffer, CursorPosition)
+		local Byte2 = BufferReadU8(TargetBuffer, CursorPosition + 1)
+		local Byte3 = BufferReadU8(TargetBuffer, CursorPosition + 2)
+		return Byte1 + Bit32LShift(Byte2, 8) + Bit32LShift(Byte3, 16), CursorPosition + 3 
 	end
 }
 
@@ -548,7 +557,6 @@ DataTypes.FixedString = function(Length : number, ErrorOnTruncate : boolean?) : 
 		IsDynamic = false, ContainsInstances = false,
 		GetByteSize = function(_) return Length end,
 		Write = function(TargetBuffer, CursorPosition, Value)
-			-- FIX #9: Check for truncation error
 			local StrLen = MathMin(#Value, Length)
 			if ErrorOnTruncate and #Value > Length then
 				error(string.format("[%s] String exceeds FixedString length %d", IonErrorCodes.SIZE_LIMIT_EXCEEDED, Length))
@@ -595,9 +603,6 @@ function DataTypes.Optional<T>(Inner : TypeSerializer<T>) : TypeSerializer<T?>
 	}
 end
 
--- WARNING: Instance references can become invalid between serialization and receipt.
--- The receiver may get nil if the instance is removed from the game tree.
--- Always validate instances on the receiving end.
 DataTypes.Instance = {
 	IsDynamic = false, ContainsInstances = true,
 	GetByteSize = function(_) return 2 end,
@@ -954,7 +959,7 @@ function DataTypes.Array<T>(Inner : TypeSerializer<T>) : TypeSerializer<{ T }>
 		end,
 		Write = function(TargetBuffer, CursorPosition, Value, InstanceAccumulator, InstanceLookup)
 			local Count = #Value
-			-- FIX #4: Check size BEFORE iteration
+			-- Check size BEFORE iteration
 			if Count > MaxCollectionSize then error(string.format("[%s] Array size %d exceeds limit", IonErrorCodes.SIZE_LIMIT_EXCEEDED, Count)) end
 			
 			TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 4)
@@ -998,7 +1003,7 @@ function DataTypes.Map<K, V>(KeyType : TypeSerializer<K>, ValType : TypeSerializ
 		Write = function(TargetBuffer, CursorPosition, Value, InstanceAccumulator, InstanceLookup)
 			local Count = 0
 			for _ in pairs(Value) do Count += 1 end
-			-- FIX #4: Check size BEFORE iteration
+			-- Check size BEFORE iteration
 			if Count > MaxCollectionSize then error(string.format("[%s] Map size %d exceeds limit", IonErrorCodes.SIZE_LIMIT_EXCEEDED, Count)) end
 			
 			TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 4)
@@ -1048,7 +1053,7 @@ function DataTypes.Struct(StructureDefinition)
 		GetByteSize = function(Value) 
 			local Size = 0 
 			for _, Key in ipairs(SortedKeys) do 
-				-- FIX #5: Check for nil values in Struct keys to prevent silent errors
+				-- Check for nil values in Struct keys to prevent silent errors
 				local Val = Value[Key]
 				if Val == nil and not IsDynamic then
 					warn(string.format("Ion: Struct field '%s' is nil - will use default value", Key))
@@ -1083,7 +1088,7 @@ Ion.Types = DataTypes
 local function PreparePacket(Schema, Args, Hash, SchemaVersion, UseCompression, CompressThreshold)
 	local PayloadBuf = AcquireBuffer(1024)
 	
-	-- FIX #6: pcall now wraps compression too
+	-- pcall now wraps compression too
 	local Success, Result = pcall(function()
 		local Cursor, Acc, Look = 0, {}, {}
 		for Index, Serializer in ipairs(Schema) do 
@@ -1146,7 +1151,7 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 		if Namespace == nil or Namespace == "" or #Namespace == 0 then
 			error(string.format("[%s] Namespace cannot be empty", IonErrorCodes.INVALID_CONFIG))
 		end
-		-- FIX #14: Handle empty namespace after trim
+		-- Handle empty namespace after trim
 		local TrimmedNamespace = Namespace:match("^%s*(.-)%s*$")
 		if Namespace ~= TrimmedNamespace then
 			warn("Ion: Namespace has leading/trailing whitespace - trimming")
@@ -1179,7 +1184,7 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 			end
 		end
 		
-		-- FIX #1: Validate SchemaVersion is integer
+		-- Validate SchemaVersion is integer
 		local SchemaVersion = Options and Options.SchemaVersion or 1
 		if type(SchemaVersion) ~= "number" or SchemaVersion ~= math.floor(SchemaVersion) then
 			error(string.format("[%s] SchemaVersion must be an integer", IonErrorCodes.INVALID_CONFIG))
@@ -1188,10 +1193,10 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 			error(string.format("[%s] SchemaVersion must be 0-255", IonErrorCodes.INVALID_CONFIG))
 		end
 		
-		-- FIX #2: Configurable Timeout
+		-- Configurable Timeout
 		local RemoteTimeout = Options and Options.RemoteTimeout or 10
 		
-		-- Rate Limiter Setup (FIX #5)
+		-- Rate Limiter Setup
 		local RateLimitConfig = Options and Options.RateLimit
 		local RateLimitState = if RateLimitConfig then {
 			History = {},
@@ -1204,7 +1209,8 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 			Created = os.time(), 
 			IsDestroyed = false,
 			Generation = 1,
-			RateLimitState = RateLimitState
+			ClientRateLimitState = RateLimitState,
+			ServerRateLimitState = {}
 		}
 		
 		local IsUnreliable = Options and Options.Unreliable or false
@@ -1214,7 +1220,7 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 		local RemoteName = "Ion_".. Hash
 
 		local function OnEvent(Player : Player | buffer, Data : buffer | {Instance}?, Instances : {Instance}?)
-			-- FIX A: Initial destroyed check
+			-- Initial destroyed check
 			local PacketData = ActivePackets[Hash]
 			if not PacketData or PacketData.IsDestroyed then return end
 			
@@ -1223,8 +1229,44 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 			local CursorPosition = 0
 			local StartTime = os.clock()
 			
-			-- FIX 1: Clean pcall pattern
-			local Success, Error = pcall(function()
+			-- Server-Side Receive Rate Limiting (Prevent Client Spam)
+			if RunService:IsServer() and RateLimitConfig then
+				local Sender = Player :: Player
+				local UserId = Sender.UserId
+				
+				-- Init server state for player if missing
+				if not PacketData.ServerRateLimitState then PacketData.ServerRateLimitState = {} end
+				local ServerState = PacketData.ServerRateLimitState
+				local PlayerState = ServerState[UserId]
+				
+				if not PlayerState then
+					PlayerState = { History = {}, WindowStart = 0 }
+					ServerState[UserId] = PlayerState
+				end
+				
+				local Now = os.clock()
+				if Now - PlayerState.WindowStart > RateLimitConfig.Window then
+					PlayerState.History = {}
+					PlayerState.WindowStart = Now
+				end
+				
+				local Cutoff = Now - RateLimitConfig.Window
+				for i = #PlayerState.History, 1, -1 do
+					if PlayerState.History[i] < Cutoff then
+						table.remove(PlayerState.History, i)
+					end
+				end
+				
+				if #PlayerState.History >= RateLimitConfig.MaxRequests then
+					warn(string.format("[%s] Rate limit exceeded from player %d", IonErrorCodes.RATE_LIMITED, UserId))
+					return -- Drop packet
+				end
+				
+				table.insert(PlayerState.History, Now)
+			end
+
+			-- Capture success, result, AND message
+			local Success, ErrorOrMessage = pcall(function()
 				CheckBounds(SourceBuffer, CursorPosition, 7)
 				local Ver = BufferReadU8(SourceBuffer, CursorPosition)
 				local PId = BufferReadU32(SourceBuffer, CursorPosition + 1)
@@ -1243,7 +1285,7 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 					BufferCopy(CompPayload, 0, SourceBuffer, 7, CompSize)
 					
 					local DecompSuccess, DecompResult = pcall(EncodingService.DecompressBuffer, EncodingService, CompPayload, Enum.CompressionAlgorithm.Zstd)
-					-- FIX 3: Added correct error code for decompression failure
+					-- Added correct error code for decompression failure
 					if not DecompSuccess then error(string.format("[%s] Decompression failed: %s", IonErrorCodes.DECOMPRESSION_FAILED, tostring(DecompResult))) end
 					
 					SourceBuffer = DecompResult
@@ -1253,7 +1295,7 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 			end)
 
 			if not Success then 
-				warn("Ion Packet Error: " .. tostring(Error)) 
+				warn("Ion Packet Error: " .. tostring(ErrorOrMessage)) 
 				return 
 			end
 
@@ -1276,7 +1318,7 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 				RecordPerformance("deserialize", os.clock() - StartTime, BufferLen(SourceBuffer))
 				
 				if Hooks and Hooks.OnAfterReceived then
-					-- FIX 7: Middleware error handling
+					-- Middleware error handling
 					local MiddlewareSuccess, MiddlewareErr = pcall(function()
 						if RunService:IsServer() then
 							Hooks.OnAfterReceived(Player, table.unpack(Args))
@@ -1287,7 +1329,7 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 					if not MiddlewareSuccess then warn("Ion Middleware Error: " .. tostring(MiddlewareErr)) end
 				end
 				
-				-- FIX A: Final race condition check
+				-- Final race condition check
 				if ActivePackets[Hash].IsDestroyed then return end
 				
 				if RunService:IsServer() then Callback(Player, table.unpack(Args)) else Callback(table.unpack(Args)) end
@@ -1309,7 +1351,7 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 					Remote = ReplicatedStorage:WaitForChild(RemoteName, 2)
 				end
 			end
-			-- FIX 2: Safer client error - return stub instead of crashing
+			-- Safer client error - return stub instead of crashing
 			if not Remote then 
 				warn(string.format("[%s] Remote missing for %s - packet will be non-functional", IonErrorCodes.REMOTE_MISSING, Namespace))
 				return GetStubPacket()
@@ -1324,39 +1366,12 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 			local PacketData = ActivePackets[Hash]
 			if not PacketData or PacketData.IsDestroyed then return false end
 			
-			-- FIX #5: Rate Limiting
-			if RateLimitConfig and PacketData.RateLimitState then
-				local Now = os.clock()
-				local State = PacketData.RateLimitState
-				
-				-- Sliding Window Reset
-				if Now - State.WindowStart > RateLimitConfig.Window then
-					State.History = {}
-					State.WindowStart = Now
-				end
-				
-				-- Cleanup old entries
-				local Cutoff = Now - RateLimitConfig.Window
-				for i = #State.History, 1, -1 do
-					if State.History[i] < Cutoff then
-						table.remove(State.History, i)
-					end
-				end
-				
-				if #State.History >= RateLimitConfig.MaxRequests then
-					warn(string.format("[%s] Rate limit exceeded for %s", IonErrorCodes.SIZE_LIMIT_EXCEEDED, Namespace))
-					return false
-				end
-				
-				table.insert(State.History, Now)
-			end
-
 			if not Definitions[Hash] then return false end
 			local Remote : any = RemoteCache[Hash]
 			if not Remote or not Remote.Parent then return false end
 
 			local Args = table.pack(...)
-			-- FIX 3: Explicit Middleware Handling
+			-- Explicit Middleware Handling
 			if Hooks and Hooks.OnBeforeSend then
 				local MiddlewareSuccess, MiddlewareResult = pcall(Hooks.OnBeforeSend, ...)
 				if not MiddlewareSuccess then 
@@ -1373,6 +1388,31 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 					warn(string.format("Ion: OnBeforeSend returned unexpected type '%s' - ignoring", type(MiddlewareResult)))
 				end
 			end
+			
+			-- Client-Side / Outgoing Rate Limiting
+			if RateLimitConfig and PacketData.ClientRateLimitState then
+				local Now = os.clock()
+				local State = PacketData.ClientRateLimitState
+				
+				if Now - State.WindowStart > RateLimitConfig.Window then
+					State.History = {}
+					State.WindowStart = Now
+				end
+				
+				local Cutoff = Now - RateLimitConfig.Window
+				for i = #State.History, 1, -1 do
+					if State.History[i] < Cutoff then
+						table.remove(State.History, i)
+					end
+				end
+				
+				if #State.History >= RateLimitConfig.MaxRequests then
+					warn(string.format("[%s] Rate limit exceeded for %s", IonErrorCodes.RATE_LIMITED, Namespace))
+					return false
+				end
+				
+				table.insert(State.History, Now)
+			end
 
 			if IsUnreliable then
 				local EstSize = 7
@@ -1380,7 +1420,7 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 				local SizeCheckSuccess = pcall(function() 
 					for Index, Serializer in ipairs(Schema) do 
 						EstSize += Serializer.GetByteSize(Args[Index])
-						-- FIX #4: Better estimation including instance overhead
+						-- Better estimation including instance overhead
 						if Serializer.ContainsInstances then
 							InstanceCount += 1
 						end
@@ -1432,8 +1472,11 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 			end
 			if #Recipients == 0 then return {} end
 			
+			-- NOTE: SendToList calls OnBeforeSend once for all recipients.
+			-- The middleware does NOT receive individual Player context.
 			local Args = table.pack(...)
-			-- FIX #6: SendToList middleware context limitation
+			
+			-- SendToList middleware context limitation check
 			if Hooks and Hooks.OnBeforeSend then
 				local MiddlewareSuccess, MiddlewareResult = pcall(Hooks.OnBeforeSend, ...)
 				if not MiddlewareSuccess then 
@@ -1456,7 +1499,7 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 			local Failed = {}
 			local Remote : any = RemoteCache[Hash]
 			for _, Plr in ipairs(Recipients) do
-				-- FIX #5: Wrap FireClient in pcall
+				-- Wrap FireClient in pcall
 				if Plr and Plr.Parent then 
 					local SendSuccess = pcall(function()
 						Remote:FireClient(Plr, PacketBuffer, PacketInsts) 
