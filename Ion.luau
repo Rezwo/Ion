@@ -67,7 +67,7 @@ local PoolCapacity : number = 64
 local PoolBufferSize : number = 4096
 local MaxSafeInteger : number = 9007199254740991 -- 2^53 - 1
 local EulerScalingFactor : number = 10430.0 -- Safe scaling for CFrameFloat16
-local MaxEnumCacheSize : number = 500 -- Increased to prevent thrashing
+local MaxEnumCacheSize : number = 500
 
 local IonErrorCodes = {
 	BUFFER_OVERFLOW = "E001",
@@ -76,6 +76,7 @@ local IonErrorCodes = {
 	PACKET_ID_MISMATCH = "E004",
 	SCHEMA_MISMATCH = "E005",
 	COMPRESSION_FAILED = "E006",
+	DECOMPRESSION_FAILED = "E007", -- Fixed: Added missing error code
 	SERIALIZATION_FAILED = "E008",
 	DESERIALIZATION_FAILED = "E009",
 	SIZE_LIMIT_EXCEEDED = "E010",
@@ -135,7 +136,7 @@ local Definitions : { [number] : any } = {}
 local Listeners : { [number] : (...any) -> () } = {}
 local RemoteCache : { [number] : RemoteEvent | UnreliableRemoteEvent } = {}
 local RemoteConnections : { [number] : RBXScriptConnection } = {}
-local ActivePackets : { [number] : { Namespace: string, Created: number } } = {}
+local ActivePackets : { [number] : { Namespace: string, Created: number, IsDestroyed: boolean } } = {}
 
 local DebugMode = false
 local DebugLogger : ((message: string, level: string) -> ())? = nil
@@ -181,9 +182,6 @@ end
 -- BUFFER MANAGEMENT
 --------------------------------------------------------------------------------
 
--- NOTE: This BufferPool is per-VM (Script/LocalScript).
--- It is NOT thread-safe for Parallel Luau (Actors) sharing the same ModuleScript reference.
--- Each Actor receives its own copy of the module, so this is generally safe in Roblox.
 local function InitializeBufferPool()
 	if BufferPoolInitialized then return end
 	for PoolIndex = 1, PoolCapacity do
@@ -194,7 +192,7 @@ end
 
 local function ReleaseBuffer(BufferToRelease : buffer)
 	local CurrentLength = BufferLen(BufferToRelease)
-	-- Only pool exact matches to standard size to prevent memory fragmentation/leaks
+	-- Only pool exact matches to standard size to prevent memory fragmentation
 	if CurrentLength == PoolBufferSize and #BufferPool < PoolCapacity then
 		-- Security: Wipe data before pooling to prevent info leaks
 		BufferFill(BufferToRelease, 0, 0, PoolBufferSize)
@@ -1115,6 +1113,7 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 		end
 		
 		-- RestOfString validation
+		-- NOTE: Ensures RestOfString is only used as the very last field in the top-level schema.
 		for Index = 1, #Schema - 1 do
 			if Schema[Index].IsUnbounded then
 				error("Ion: RestOfString can only be the last field in schema")
@@ -1138,7 +1137,9 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 		local RemoteName = "Ion_".. Hash
 
 		local function OnEvent(Player : Player | buffer, Data : buffer | {Instance}?, Instances : {Instance}?)
-			if ActivePackets[Hash] and ActivePackets[Hash].IsDestroyed then return end
+			-- FIX 1: Safety check against destroyed packets
+			local PacketData = ActivePackets[Hash]
+			if not PacketData or PacketData.IsDestroyed then return end
 			
 			local SourceBuffer = if RunService:IsServer() then Data :: buffer else Player :: buffer
 			local SourceInstances = if RunService:IsServer() then Instances :: {Instance} else Data :: {Instance}
@@ -1165,6 +1166,7 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 					BufferCopy(CompPayload, 0, SourceBuffer, 7, CompSize)
 					
 					local DecompSuccess, DecompResult = pcall(EncodingService.DecompressBuffer, EncodingService, CompPayload, Enum.CompressionAlgorithm.Zstd)
+					-- FIX 3: Added correct error code for decompression failure
 					if not DecompSuccess then error(string.format("[%s] Decompression failed: %s", IonErrorCodes.DECOMPRESSION_FAILED, tostring(DecompResult))) end
 					
 					SourceBuffer = DecompResult
@@ -1228,7 +1230,10 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 		local PacketObject = {}
 		
 		function PacketObject.Send(Target : Player?, ... : any) : boolean
-			if ActivePackets[Hash] and ActivePackets[Hash].IsDestroyed then return false end
+			-- FIX 1: Safety check against destroyed packets
+			local PacketData = ActivePackets[Hash]
+			if not PacketData or PacketData.IsDestroyed then return false end
+			
 			if not Definitions[Hash] then return false end
 			local Remote : any = RemoteCache[Hash]
 			if not Remote or not Remote.Parent then return false end
@@ -1315,14 +1320,21 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 		function PacketObject.Listen(Cb) Listeners[Hash] = Cb end
 		
 		function PacketObject.Destroy()
+			-- FIX 2: Proper destroy logic to prevent race conditions
+			local PacketData = ActivePackets[Hash]
+			if not PacketData or PacketData.IsDestroyed then return end
+			
 			DebugLog("Destroying Packet "..Namespace, "INFO")
-			if ActivePackets[Hash] then ActivePackets[Hash].IsDestroyed = true end
+			PacketData.IsDestroyed = true
+			
 			Listeners[Hash] = nil
 			local Conn = RemoteConnections[Hash]
 			if Conn then Conn:Disconnect() end
 			RemoteConnections[Hash] = nil
+			
 			local Remote = RemoteCache[Hash]
 			if Remote and typeof(Remote) == "Instance" and Remote.Parent then Remote:Destroy() end
+			
 			RemoteCache[Hash] = nil
 			Definitions[Hash] = nil
 			ActivePackets[Hash] = nil
