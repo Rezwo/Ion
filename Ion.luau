@@ -7,10 +7,6 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Players = game:GetService("Players")
 local EncodingService = game:GetService("EncodingService")
 
---------------------------------------------------------------------------------
--- OPTIMIZATIONS & LOCALS
---------------------------------------------------------------------------------
-
 local BufferWriteU8 = buffer.writeu8
 local BufferWriteU16 = buffer.writeu16
 local BufferWriteU32 = buffer.writeu32
@@ -52,23 +48,18 @@ local MathMin = math.min
 local MathCeil = math.ceil
 local MathLog = math.log
 
---------------------------------------------------------------------------------
--- CONFIGURATION & CONSTANTS
---------------------------------------------------------------------------------
-
 local IonVersion : number = 1
 local MaxPacketSize : number = 900
-local MaxBufferSize : number = 100 * 1024 * 1024 -- 100MB Hard Limit
-local MaxBufferBlobSize : number = 10 * 1024 * 1024 -- 10MB Limit for single Blob/String
+local MaxBufferSize : number = 100 * 1024 * 1024
+local MaxBufferBlobSize : number = 10 * 1024 * 1024
 local BufferGrowthFactor : number = 1.5
-local MaxCollectionSize : number = 100000 -- 100k items limit
-local MaxStringSize : number = 1000000 -- 1MB string limit
-local CompressionThreshold : number = 128 -- Bytes
+local MaxCollectionSize : number = 100000
+local MaxStringSize : number = 1000000
+local CompressionThreshold : number = 128
 local CompressionRatioEstimate : number = 0.7
 local PoolCapacity : number = 64
 local PoolBufferSize : number = 4096
-local MaxSafeInteger : number = 9007199254740991 -- 2^53 - 1
--- 10430.0 keeps PI * Factor < 32767 to fit in Int16
+local MaxSafeInteger : number = 9007199254740991
 local EulerScalingFactor : number = 10430.0 
 local MaxEnumCacheSize : number = 500
 
@@ -92,10 +83,6 @@ local IonErrorCodes = {
 	TIMEOUT = "E017",
 	RATE_LIMITED = "E018"
 }
-
---------------------------------------------------------------------------------
--- PUBLIC TYPE EXPORTS
---------------------------------------------------------------------------------
 
 export type IonPacket<Arguments...> = {
 	Server : {
@@ -135,20 +122,14 @@ export type IonDefinitionOptions = {
 	}?
 }
 
---------------------------------------------------------------------------------
--- STATE & DIAGNOSTICS
---------------------------------------------------------------------------------
-
 local BufferPool : { buffer } = {}
 local BufferPoolInitialized : boolean = false
 
--- Caches
 local EnumSerializerCache : { [any] : any } = {}
 local EnumSerializerCacheOrder : { any } = {}
 local AnyEnumCache : { [any] : { [number] : EnumItem } } = {}
 local AnyEnumCacheOrder : { any } = {}
 
--- Packet Tracking
 type RateLimitState = {
 	History : { number },
 	WindowStart : number
@@ -159,9 +140,7 @@ type PacketMetadata = {
 	Created : number,
 	IsDestroyed : boolean,
 	Generation : number,
-	-- Client-side sending limit (used on Client and Server for outgoing)
 	ClientRateLimitState : RateLimitState?,
-	-- Server-side receiving limit (UserId -> State)
 	ServerRateLimitState : { [number] : RateLimitState }?
 }
 
@@ -211,10 +190,6 @@ local function RecordPerformance(Operation : string, Duration : number, Bytes : 
 	end
 end
 
---------------------------------------------------------------------------------
--- BUFFER MANAGEMENT
---------------------------------------------------------------------------------
-
 local function InitializeBufferPool()
 	if BufferPoolInitialized then return end
 	for PoolIndex = 1, PoolCapacity do
@@ -225,13 +200,10 @@ end
 
 local function ReleaseBuffer(BufferToRelease : buffer)
 	local CurrentLength = BufferLen(BufferToRelease)
-	-- Only pool exact matches to standard size to prevent memory fragmentation
 	if CurrentLength == PoolBufferSize and #BufferPool < PoolCapacity then
-		-- Security: Wipe data before pooling to prevent info leaks
 		BufferFill(BufferToRelease, 0, 0, PoolBufferSize)
 		table.insert(BufferPool, BufferToRelease)
 	end
-	-- Oversized/Undersized buffers are left to GC
 end
 
 local function AcquireBuffer(MinimumSize : number) : buffer
@@ -257,7 +229,6 @@ local function EnsureCapacity(TargetBuffer : buffer, CursorPosition : number, Si
 		return TargetBuffer
 	end
 
-	-- Power of 2 growth to reduce fragmentation
 	local NewLength = 2 ^ MathCeil(MathLog(RequiredSize, 2))
 
 	if NewLength > MaxBufferSize then
@@ -270,7 +241,6 @@ local function EnsureCapacity(TargetBuffer : buffer, CursorPosition : number, Si
 	local NewBuffer = BufferCreate(NewLength)
 	BufferCopy(NewBuffer, 0, TargetBuffer, 0, CurrentLength)
 
-	-- Always release the old buffer (ReleaseBuffer handles validation)
 	ReleaseBuffer(TargetBuffer)
 
 	return NewBuffer
@@ -282,16 +252,11 @@ local function CheckBounds(TargetBuffer : buffer, CursorPosition : number, Size 
 	end
 end
 
---------------------------------------------------------------------------------
--- UTILITIES
---------------------------------------------------------------------------------
-
 local function FNV1a(StringValue : string) : number
 	local Hash : number = 2166136261
 	local Prime : number = 16777619
 	for Index = 1, #StringValue do
 		Hash = Bit32Xor(Hash, string.byte(StringValue, Index))
-		-- Ensure 32-bit clamping before multiplication to minimize overflow
 		Hash = Bit32Band(Hash, 4294967295) 
 		Hash = Bit32Band(Hash * Prime, 4294967295)
 	end
@@ -305,15 +270,15 @@ local function WriteFloat16(TargetBuffer : buffer, CursorPosition : number, Valu
 
 	if Value == 0 then
 		Encoded = Sign
-	elseif Value > 65504 then -- Value > MaxFloat16
+	elseif Value > 65504 then
 		Encoded = Sign + 0x7C00
-	elseif Value ~= Value then -- NaN
+	elseif Value ~= Value then
 		Encoded = 0x7FFF
 	else
 		local Mantissa : number, Exponent : number = MathFrexp(Value)
 		Exponent += 14
 
-		if Exponent <= 0 then -- Denormalized
+		if Exponent <= 0 then
 			if Exponent < -10 then
 				Encoded = Sign
 			else
@@ -321,9 +286,9 @@ local function WriteFloat16(TargetBuffer : buffer, CursorPosition : number, Valu
 				local MantissaBits = MathClamp(MathFloor(Mantissa + 0.5), 0, 1023)
 				Encoded = Sign + MantissaBits
 			end
-		elseif Exponent >= 31 then -- Overflow
+		elseif Exponent >= 31 then
 			Encoded = Sign + 0x7C00
-		else -- Normalized
+		else
 			local MantissaValue = (Mantissa * 2 - 1) * 1024
 			local MantissaBits = MathClamp(MathFloor(MantissaValue + 0.5), 0, 1023)
 			Encoded = Sign + Bit32LShift(Exponent, 10) + MantissaBits
@@ -360,13 +325,8 @@ local function DecomposeInt64(Value : number) : (number, number)
 	return High, Low
 end
 
---------------------------------------------------------------------------------
--- SERIALIZERS
---------------------------------------------------------------------------------
-
 local DataTypes = {}
 
--- Primitives
 local function CreatePrimitive(Size: number, WriteFunc: (buffer, number, number) -> (), ReadFunc: (buffer, number) -> number, ClampMin: number?, ClampMax: number?) : TypeSerializer<number>
 	return {
 		IsDynamic = false, ContainsInstances = false,
@@ -1074,10 +1034,6 @@ function DataTypes.Struct(StructureDefinition : { [string]: TypeSerializer<any> 
 		end
 	}
 end
-
---------------------------------------------------------------------------------
--- CORE LOGIC (Shared)
---------------------------------------------------------------------------------
 
 local Ion = {}
 Ion.Types = DataTypes
