@@ -160,13 +160,10 @@ end
 
 local function ReleaseBuffer(BufferToRelease : buffer)
 	local CurrentLength = BufferLen(BufferToRelease)
-	-- Only pool exact matches to standard size to prevent memory fragmentation/leaks
 	if CurrentLength == PoolBufferSize and #BufferPool < PoolCapacity then
-		-- Security: Wipe data before pooling to prevent info leaks
 		BufferFill(BufferToRelease, 0, 0, PoolBufferSize)
 		table.insert(BufferPool, BufferToRelease)
 	end
-	-- Oversized/Undersized buffers are left to GC
 end
 
 local function AcquireBuffer(MinimumSize : number) : buffer
@@ -192,7 +189,6 @@ local function EnsureCapacity(TargetBuffer : buffer, CursorPosition : number, Si
 		return TargetBuffer
 	end
 	
-	-- Growth logic with hard limit
 	local NewLength = MathMax(math.ceil(CurrentLength * BufferGrowthFactor), RequiredSize)
 	
 	if NewLength > MaxBufferSize then
@@ -204,10 +200,7 @@ local function EnsureCapacity(TargetBuffer : buffer, CursorPosition : number, Si
 	
 	local NewBuffer = BufferCreate(NewLength)
 	BufferCopy(NewBuffer, 0, TargetBuffer, 0, CurrentLength)
-	
-	-- Always release the old buffer (ReleaseBuffer handles validation)
 	ReleaseBuffer(TargetBuffer)
-	
 	return NewBuffer
 end
 
@@ -238,15 +231,15 @@ local function WriteFloat16(TargetBuffer : buffer, CursorPosition : number, Valu
 	
 	if Value == 0 then
 		Encoded = Sign
-	elseif Value >= 65504 then -- Infinity/Overflow
+	elseif Value >= 65504 then
 		Encoded = Sign + 0x7C00
-	elseif Value ~= Value then -- NaN
+	elseif Value ~= Value then
 		Encoded = 0x7FFF
 	else
 		local Mantissa : number, Exponent : number = MathFrexp(Value)
 		Exponent += 14
 
-		if Exponent <= 0 then -- Denormalized
+		if Exponent <= 0 then
 			if Exponent < -10 then
 				Encoded = Sign
 			else
@@ -254,9 +247,9 @@ local function WriteFloat16(TargetBuffer : buffer, CursorPosition : number, Valu
 				local MantissaBits = MathClamp(MathFloor(Mantissa + 0.5), 0, 1023)
 				Encoded = Sign + MantissaBits
 			end
-		elseif Exponent >= 31 then -- Overflow
+		elseif Exponent >= 31 then
 			Encoded = Sign + 0x7C00
-		else -- Normalized
+		else
 			local MantissaValue = (Mantissa * 2 - 1) * 1024
 			local MantissaBits = MathClamp(MathFloor(MantissaValue + 0.5), 0, 1023)
 			Encoded = Sign + Bit32LShift(Exponent, 10) + MantissaBits
@@ -310,7 +303,6 @@ export type Int64Struct = { Upper : number, Lower : number }
 
 local DataTypes = {}
 
--- Primitives
 local function CreatePrimitive(Size, WriteFunc, ReadFunc, ClampMin, ClampMax)
 	return {
 		IsDynamic = false, ContainsInstances = false,
@@ -394,17 +386,13 @@ DataTypes.UInt64 = {
 		local Upper, Lower
 		if type(Value) == "table" then
 			Upper, Lower = Value.Upper or 0, Value.Lower or 0
-			-- CRITICAL: Validate table values are non-negative
 			if Upper < 0 or Lower < 0 then
-				error(string.format("[%s] UInt64 requires non-negative values (got Upper=%d, Lower=%d)", 
-					IonErrorCodes.SERIALIZATION_FAILED, Upper, Lower))
+				error(string.format("[%s] UInt64 requires non-negative values", IonErrorCodes.SERIALIZATION_FAILED))
 			end
 		else
 			local N = tonumber(Value) or 0
-			-- CRITICAL: Validate number is non-negative
 			if N < 0 then
-				error(string.format("[%s] UInt64 requires non-negative value (got %f)", 
-					IonErrorCodes.SERIALIZATION_FAILED, N))
+				error(string.format("[%s] UInt64 requires non-negative value", IonErrorCodes.SERIALIZATION_FAILED))
 			end
 			Upper, Lower = DecomposeInt64(N)
 		end
@@ -427,8 +415,8 @@ DataTypes.Int64 = {
 		if type(Value) == "table" then
 			High, Low = Value.Upper or 0, Value.Lower or 0
 		else
-			local NumberValue = tonumber(Value) or 0
-			High, Low = DecomposeInt64(NumberValue)
+			local N = tonumber(Value) or 0
+			High, Low = DecomposeInt64(N)
 		end
 		BufferWriteI32(TargetBuffer, CursorPosition, High)
 		BufferWriteU32(TargetBuffer, CursorPosition + 4, Low)
@@ -552,7 +540,6 @@ DataTypes.Instance = {
 	GetByteSize = function(_) return 2 end,
 	Write = function(TargetBuffer, CursorPosition, Value, InstanceAccumulator, InstanceLookup)
 		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 2)
-		-- Safety: pcall validation prevents crashes on destroyed instances
 		local IsValid = false
 		if Value and typeof(Value) == "Instance" then
 			local Success, Result = pcall(function() return Value:IsDescendantOf(game) end)
@@ -678,18 +665,22 @@ DataTypes.CFrameFloat16 = {
 		WriteFloat16(TargetBuffer, CursorPosition + 2, Value.Y)
 		WriteFloat16(TargetBuffer, CursorPosition + 4, Value.Z)
 		local EulerX, EulerY, EulerZ = Value:ToEulerAnglesXYZ()
-		BufferWriteI16(TargetBuffer, CursorPosition + 6, MathClamp(MathRound(EulerX * EulerScalingFactor), -32767, 32767))
-		BufferWriteI16(TargetBuffer, CursorPosition + 8, MathClamp(MathRound(EulerY * EulerScalingFactor), -32767, 32767))
-		BufferWriteI16(TargetBuffer, CursorPosition + 10, MathClamp(MathRound(EulerZ * EulerScalingFactor), -32767, 32767))
+		-- FIX #2: Sanitize Euler angles before scaling
+		local SafeEX = if EulerX == EulerX then EulerX else 0
+		local SafeEY = if EulerY == EulerY then EulerY else 0
+		local SafeEZ = if EulerZ == EulerZ then EulerZ else 0
+		BufferWriteI16(TargetBuffer, CursorPosition + 6, MathClamp(MathRound(SafeEX * EulerScalingFactor), -32767, 32767))
+		BufferWriteI16(TargetBuffer, CursorPosition + 8, MathClamp(MathRound(SafeEY * EulerScalingFactor), -32767, 32767))
+		BufferWriteI16(TargetBuffer, CursorPosition + 10, MathClamp(MathRound(SafeEZ * EulerScalingFactor), -32767, 32767))
 		return TargetBuffer, CursorPosition + 12
 	end,
 	Read = function(TargetBuffer, CursorPosition)
 		CheckBounds(TargetBuffer, CursorPosition, 12)
-		local PosX, PosY, PosZ = ReadFloat16(TargetBuffer, CursorPosition), ReadFloat16(TargetBuffer, CursorPosition + 2), ReadFloat16(TargetBuffer, CursorPosition + 4)
-		local EulerX = BufferReadI16(TargetBuffer, CursorPosition + 6) / EulerScalingFactor
-		local EulerY = BufferReadI16(TargetBuffer, CursorPosition + 8) / EulerScalingFactor
-		local EulerZ = BufferReadI16(TargetBuffer, CursorPosition + 10) / EulerScalingFactor
-		return CFrame.fromEulerAnglesXYZ(EulerX, EulerY, EulerZ) + Vector3.new(PosX, PosY, PosZ), CursorPosition + 12
+		local PX, PY, PZ = ReadFloat16(TargetBuffer, CursorPosition), ReadFloat16(TargetBuffer, CursorPosition + 2), ReadFloat16(TargetBuffer, CursorPosition + 4)
+		local EX = BufferReadI16(TargetBuffer, CursorPosition + 6) / EulerScalingFactor
+		local EY = BufferReadI16(TargetBuffer, CursorPosition + 8) / EulerScalingFactor
+		local EZ = BufferReadI16(TargetBuffer, CursorPosition + 10) / EulerScalingFactor
+		return CFrame.fromEulerAnglesXYZ(EX, EY, EZ) + Vector3.new(PX, PY, PZ), CursorPosition + 12
 	end
 }
 
@@ -699,7 +690,9 @@ DataTypes.CFrame = {
 	Write = function(TargetBuffer, CursorPosition, Value)
 		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 24)
 		local Axis, Angle = Value:ToAxisAngle()
-		local Rot = if Angle ~= Angle or Axis.X ~= Axis.X then Vector3.zero else Axis * Angle
+		-- FIX #1: Check ALL components for NaN
+		local HasNaN = Angle ~= Angle or Axis.X ~= Axis.X or Axis.Y ~= Axis.Y or Axis.Z ~= Axis.Z
+		local Rot = if HasNaN then Vector3.zero else Axis * Angle
 		BufferWriteF32(TargetBuffer, CursorPosition, Value.X)
 		BufferWriteF32(TargetBuffer, CursorPosition + 4, Value.Y)
 		BufferWriteF32(TargetBuffer, CursorPosition + 8, Value.Z)
@@ -883,11 +876,24 @@ function DataTypes.Array<T>(Inner : TypeSerializer<T>) : TypeSerializer<{ T }>
 	return {
 		IsDynamic = true, ContainsInstances = Inner.ContainsInstances,
 		GetByteSize = function(Value) 
-			if not Inner.IsDynamic then return 4 + (#Value * Inner.GetByteSize(nil :: any)) end
-			local Size = 4; for _, Item in ipairs(Value) do Size += Inner.GetByteSize(Item) end return Size
+			local Count = #Value
+			if Count > MaxCollectionSize then 
+				error(string.format("[%s] Array size %d exceeds limit", IonErrorCodes.SIZE_LIMIT_EXCEEDED, Count))
+			end
+			
+			if not Inner.IsDynamic then return 4 + (Count * Inner.GetByteSize(nil :: any)) end
+			local Size = 4
+			for _, Item in ipairs(Value) do 
+				Size += Inner.GetByteSize(Item)
+				if Size > MaxBufferSize then error(string.format("[%s] Array byte size exceeds limit", IonErrorCodes.SIZE_LIMIT_EXCEEDED)) end
+			end
+			return Size
 		end,
 		Write = function(TargetBuffer, CursorPosition, Value, InstanceAccumulator, InstanceLookup)
 			local Count = #Value
+			-- FIX #3: Check size BEFORE iteration
+			if Count > MaxCollectionSize then error(string.format("[%s] Array size %d exceeds limit", IonErrorCodes.SIZE_LIMIT_EXCEEDED, Count)) end
+			
 			TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 4)
 			BufferWriteU32(TargetBuffer, CursorPosition, Count)
 			CursorPosition += 4
@@ -917,12 +923,21 @@ function DataTypes.Map<K, V>(KeyType : TypeSerializer<K>, ValType : TypeSerializ
 		IsDynamic = true, ContainsInstances = KeyType.ContainsInstances or ValType.ContainsInstances,
 		GetByteSize = function(Value)
 			local Size = 4
-			for Key, Val in pairs(Value) do Size += KeyType.GetByteSize(Key) + ValType.GetByteSize(Val) end
+			local Count = 0
+			for Key, Val in pairs(Value) do 
+				Count += 1
+				if Count > MaxCollectionSize then error(string.format("[%s] Map size exceeds limit", IonErrorCodes.SIZE_LIMIT_EXCEEDED)) end
+				Size += KeyType.GetByteSize(Key) + ValType.GetByteSize(Val)
+				if Size > MaxBufferSize then error(string.format("[%s] Map byte size exceeds limit", IonErrorCodes.SIZE_LIMIT_EXCEEDED)) end
+			end
 			return Size
 		end,
 		Write = function(TargetBuffer, CursorPosition, Value, InstanceAccumulator, InstanceLookup)
 			local Count = 0
 			for _ in pairs(Value) do Count += 1 end
+			-- FIX #4: Check size BEFORE iteration
+			if Count > MaxCollectionSize then error(string.format("[%s] Map size %d exceeds limit", IonErrorCodes.SIZE_LIMIT_EXCEEDED, Count)) end
+			
 			TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 4)
 			BufferWriteU32(TargetBuffer, CursorPosition, Count)
 			CursorPosition += 4
@@ -1042,8 +1057,38 @@ end
 
 function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Options)
 	local Success, Result = pcall(function()
+		-- FIX #8: Namespace Validation
+		if Namespace == nil or Namespace == "" or #Namespace == 0 then
+			error(string.format("[%s] Namespace cannot be empty", IonErrorCodes.INVALID_CONFIG))
+		end
+		if Namespace ~= Namespace:match("^%s*(.-)%s*$") then
+			warn("Ion: Namespace has leading/trailing whitespace - trimming")
+			Namespace = Namespace:match("^%s*(.-)%s*$")
+		end
+
 		local Hash = FNV1a(Namespace)
-		if Definitions[Hash] then error("Ion: Namespace collision") end
+		
+		-- FIX #6: Improved Collision Detection
+		if Definitions[Hash] then
+			local Existing = ActivePackets[Hash]
+			if Existing and Existing.Namespace == Namespace then
+				error(string.format("Ion: Packet '%s' already defined", Namespace))
+			else
+				error(string.format(
+					"Ion: Hash collision! Namespace '%s' collides with '%s' (Hash: %d). Please rename one.",
+					Namespace,
+					Existing and Existing.Namespace or "unknown",
+					Hash
+				))
+			end
+		end
+		
+		-- FIX #7: RestOfString validation
+		for Index = 1, #Schema - 1 do
+			if Schema[Index].IsUnbounded then
+				error("Ion: RestOfString can only be the last field in schema")
+			end
+		end
 		
 		local SchemaVersion = Options and Options.SchemaVersion or 1
 		if SchemaVersion < 0 or SchemaVersion > 255 then
@@ -1065,7 +1110,8 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 			local CursorPosition = 0
 			local StartTime = os.clock()
 			
-			local DeserializeSuccess, ErrorOrResult = pcall(function()
+			-- FIX #4 & #5: Capture success, result, AND message
+			local DeserializeSuccess, ValidationResult, ErrorMessage = pcall(function()
 				CheckBounds(SourceBuffer, CursorPosition, 7)
 				local Ver = BufferReadU8(SourceBuffer, CursorPosition)
 				local PId = BufferReadU32(SourceBuffer, CursorPosition + 1)
@@ -1082,15 +1128,19 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 					if CompSize > MaxBufferSize then return false, "Compressed payload exceeds limit" end
 					local CompPayload = BufferCreate(CompSize)
 					BufferCopy(CompPayload, 0, SourceBuffer, 7, CompSize)
-					SourceBuffer = EncodingService:DecompressBuffer(CompPayload, Enum.CompressionAlgorithm.Zstd)
+					
+					local DecompSuccess, DecompResult = pcall(EncodingService.DecompressBuffer, EncodingService, CompPayload, Enum.CompressionAlgorithm.Zstd)
+					if not DecompSuccess then return false, "Decompression failed: " .. tostring(DecompResult) end
+					
+					SourceBuffer = DecompResult
 					CursorPosition = 0
 					if BufferLen(SourceBuffer) > MaxBufferSize then return false, "Decompressed payload too large" end
 				end
-				return true, nil
+				return true, "OK"
 			end)
 
-			if not DeserializeSuccess then warn("Ion Error: "..tostring(ErrorOrResult)) return end
-			if ErrorOrResult == false then return end
+			if not DeserializeSuccess then warn("Ion Deserialization Error: " .. tostring(ValidationResult)) return end
+			if ValidationResult == false then warn("Ion Validation Failed: " .. tostring(ErrorMessage)) return end
 
 			local Callback = Listeners[Hash]
 			if Callback then
