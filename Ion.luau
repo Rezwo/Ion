@@ -67,7 +67,7 @@ local PoolCapacity : number = 64
 local PoolBufferSize : number = 4096
 local MaxSafeInteger : number = 9007199254740991 -- 2^53 - 1
 local EulerScalingFactor : number = 10430.0 -- Safe scaling for CFrameFloat16
-local MaxEnumCacheSize : number = 100
+local MaxEnumCacheSize : number = 500 -- Increased to prevent thrashing
 
 local IonErrorCodes = {
 	BUFFER_OVERFLOW = "E001",
@@ -83,14 +83,15 @@ local IonErrorCodes = {
 	MIDDLEWARE_ERROR = "E012",
 	PACKET_DESTROYED = "E013",
 	NOT_SUPPORTED = "E014",
-	INVALID_CONFIG = "E015"
+	INVALID_CONFIG = "E015",
+	REMOTE_MISSING = "E016",
+	TIMEOUT = "E017"
 }
 
 --------------------------------------------------------------------------------
 -- PUBLIC TYPE EXPORTS
 --------------------------------------------------------------------------------
 
--- This is the type that was missing. It is required for external casting.
 export type IonPacket<T...> = {
 	Server : {
 		SendTo : (Recipient : Player, T...) -> (boolean),
@@ -180,6 +181,9 @@ end
 -- BUFFER MANAGEMENT
 --------------------------------------------------------------------------------
 
+-- NOTE: This BufferPool is per-VM (Script/LocalScript).
+-- It is NOT thread-safe for Parallel Luau (Actors) sharing the same ModuleScript reference.
+-- Each Actor receives its own copy of the module, so this is generally safe in Roblox.
 local function InitializeBufferPool()
 	if BufferPoolInitialized then return end
 	for PoolIndex = 1, PoolCapacity do
@@ -370,10 +374,10 @@ DataTypes.UInt24 = {
 	end,
 	Read = function(TargetBuffer, CursorPosition) 
 		CheckBounds(TargetBuffer, CursorPosition, 3)
-		local Byte1 = BufferReadU8(TargetBuffer, CursorPosition)
-		local Byte2 = BufferReadU8(TargetBuffer, CursorPosition + 1)
-		local Byte3 = BufferReadU8(TargetBuffer, CursorPosition + 2)
-		return Byte1 + Bit32LShift(Byte2, 8) + Bit32LShift(Byte3, 16), CursorPosition + 3 
+		local B1 = BufferReadU8(TargetBuffer, CursorPosition)
+		local B2 = BufferReadU8(TargetBuffer, CursorPosition + 1)
+		local B3 = BufferReadU8(TargetBuffer, CursorPosition + 2)
+		return B1 + Bit32LShift(B2, 8) + Bit32LShift(B3, 16), CursorPosition + 3 
 	end
 }
 
@@ -1122,8 +1126,10 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 			error(string.format("[%s] SchemaVersion must be 0-255", IonErrorCodes.INVALID_CONFIG))
 		end
 		
+		local RemoteTimeout = Options and Options.RemoteTimeout or 10
+		
 		Definitions[Hash] = Schema
-		ActivePackets[Hash] = { Namespace = Namespace, Created = os.time() }
+		ActivePackets[Hash] = { Namespace = Namespace, Created = os.time(), IsDestroyed = false }
 		
 		local IsUnreliable = Options and Options.Unreliable or false
 		local UseCompression = Options and Options.Compress or false
@@ -1132,13 +1138,15 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 		local RemoteName = "Ion_".. Hash
 
 		local function OnEvent(Player : Player | buffer, Data : buffer | {Instance}?, Instances : {Instance}?)
+			if ActivePackets[Hash] and ActivePackets[Hash].IsDestroyed then return end
+			
 			local SourceBuffer = if RunService:IsServer() then Data :: buffer else Player :: buffer
 			local SourceInstances = if RunService:IsServer() then Instances :: {Instance} else Data :: {Instance}
 			local CursorPosition = 0
 			local StartTime = os.clock()
 			
 			-- Capture success, result, AND message
-			local DeserializeSuccess, ValidationResult, ErrorMessage = pcall(function()
+			local Success, ErrorOrMessage = pcall(function()
 				CheckBounds(SourceBuffer, CursorPosition, 7)
 				local Ver = BufferReadU8(SourceBuffer, CursorPosition)
 				local PId = BufferReadU32(SourceBuffer, CursorPosition + 1)
@@ -1146,28 +1154,29 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 				local SVer = BufferReadU8(SourceBuffer, CursorPosition + 6)
 				CursorPosition += 7
 				
-				if Ver ~= IonVersion then return false, "Version mismatch" end
-				if PId ~= Hash then return false, "ID mismatch" end
-				if SVer ~= SchemaVersion then return false, "Schema mismatch" end
+				if Ver ~= IonVersion then error(string.format("[%s] Version mismatch", IonErrorCodes.VERSION_MISMATCH)) end
+				if PId ~= Hash then error(string.format("[%s] Packet ID mismatch", IonErrorCodes.PACKET_ID_MISMATCH)) end
+				if SVer ~= SchemaVersion then error(string.format("[%s] Schema mismatch", IonErrorCodes.SCHEMA_MISMATCH)) end
 				
 				if Bit32Band(Flg, 1) == 1 then
 					local CompSize = BufferLen(SourceBuffer) - 7
-					if CompSize > MaxBufferSize then return false, "Compressed payload exceeds limit" end
+					if CompSize > MaxBufferSize then error(string.format("[%s] Compressed payload too large", IonErrorCodes.SIZE_LIMIT_EXCEEDED)) end
 					local CompPayload = BufferCreate(CompSize)
 					BufferCopy(CompPayload, 0, SourceBuffer, 7, CompSize)
 					
 					local DecompSuccess, DecompResult = pcall(EncodingService.DecompressBuffer, EncodingService, CompPayload, Enum.CompressionAlgorithm.Zstd)
-					if not DecompSuccess then return false, "Decompression failed: " .. tostring(DecompResult) end
+					if not DecompSuccess then error(string.format("[%s] Decompression failed: %s", IonErrorCodes.DECOMPRESSION_FAILED, tostring(DecompResult))) end
 					
 					SourceBuffer = DecompResult
 					CursorPosition = 0
-					if BufferLen(SourceBuffer) > MaxBufferSize then return false, "Decompressed payload too large" end
+					if BufferLen(SourceBuffer) > MaxBufferSize then error(string.format("[%s] Decompressed payload too large", IonErrorCodes.SIZE_LIMIT_EXCEEDED)) end
 				end
-				return true, "OK"
 			end)
 
-			if not DeserializeSuccess then warn("Ion Deserialization Error: " .. tostring(ValidationResult)) return end
-			if ValidationResult == false then warn("Ion Validation Failed: " .. tostring(ErrorMessage)) return end
+			if not Success then 
+				warn("Ion Packet Error: " .. tostring(ErrorOrMessage)) 
+				return 
+			end
 
 			local Callback = Listeners[Hash]
 			if Callback then
@@ -1202,15 +1211,16 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 			RemoteCache[Hash] = Remote
 			RemoteConnections[Hash] = (Remote :: any).OnServerEvent:Connect(OnEvent)
 		else
-			local Remote = ReplicatedStorage:WaitForChild(RemoteName, 10)
+			local Remote = ReplicatedStorage:WaitForChild(RemoteName, RemoteTimeout)
 			if not Remote then
+				-- Fallback polling if WaitForChild times out (rare but possible with streaming)
 				local Retries = 0
 				while not Remote and Retries < 5 do
 					Retries += 1
 					Remote = ReplicatedStorage:WaitForChild(RemoteName, 2)
 				end
 			end
-			if not Remote then error("Ion: Remote missing for "..Namespace) end
+			if not Remote then error(string.format("[%s] Remote missing for %s", IonErrorCodes.REMOTE_MISSING, Namespace)) end
 			RemoteCache[Hash] = Remote
 			RemoteConnections[Hash] = (Remote :: any).OnClientEvent:Connect(OnEvent)
 		end
@@ -1218,6 +1228,7 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 		local PacketObject = {}
 		
 		function PacketObject.Send(Target : Player?, ... : any) : boolean
+			if ActivePackets[Hash] and ActivePackets[Hash].IsDestroyed then return false end
 			if not Definitions[Hash] then return false end
 			local Remote : any = RemoteCache[Hash]
 			if not Remote or not Remote.Parent then return false end
@@ -1235,19 +1246,32 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 				local SizeCheckSuccess = pcall(function() 
 					for Index, Serializer in ipairs(Schema) do EstSize += Serializer.GetByteSize(Args[Index]) end 
 				end)
+				
 				if not SizeCheckSuccess then 
 					warn("Ion: Size check failed - aborting send") 
 					return false 
 				end
-				if UseCompression and EstSize > CompressThreshold then EstSize = math.ceil(EstSize * CompressionRatioEstimate) end
-				if EstSize > MaxPacketSize then warn("Ion: Packet likely too large") end
+				
+				if UseCompression and EstSize > CompressThreshold then 
+					EstSize = math.ceil(EstSize * CompressionRatioEstimate) 
+				end
+				
+				-- Strict enforcement of packet size for unreliable packets
+				if EstSize > MaxPacketSize then 
+					warn(string.format("[%s] Packet likely too large (%d bytes)", IonErrorCodes.SIZE_LIMIT_EXCEEDED, EstSize))
+					return false 
+				end
 			end
 			
 			local StartTime = os.clock()
 			local PacketBuffer, PacketInsts, Err = PreparePacket(Schema, Args, Hash, SchemaVersion, UseCompression, CompressThreshold)
 			if not PacketBuffer then warn(Err) return false end
 			
-			if IsUnreliable and BufferLen(PacketBuffer) > MaxPacketSize then warn("Ion: Packet too large") return false end
+			if IsUnreliable and BufferLen(PacketBuffer) > MaxPacketSize then 
+				warn(string.format("[%s] Packet too large (%d bytes)", IonErrorCodes.SIZE_LIMIT_EXCEEDED, BufferLen(PacketBuffer)))
+				return false 
+			end
+			
 			RecordPerformance("serialize", os.clock() - StartTime, BufferLen(PacketBuffer))
 			
 			DebugLog("Sent Packet "..Namespace, "DEBUG")
@@ -1278,7 +1302,12 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 			local Failed = {}
 			local Remote : any = RemoteCache[Hash]
 			for _, Plr in ipairs(Recipients) do
-				if Plr and Plr.Parent then Remote:FireClient(Plr, PacketBuffer, PacketInsts) else table.insert(Failed, Plr) end
+				if Plr and Plr.Parent then 
+					Remote:FireClient(Plr, PacketBuffer, PacketInsts) 
+				else 
+					DebugLog("SendToList failed for player: " .. tostring(Plr), "WARN")
+					table.insert(Failed, Plr) 
+				end
 			end
 			return Failed
 		end
@@ -1287,6 +1316,7 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 		
 		function PacketObject.Destroy()
 			DebugLog("Destroying Packet "..Namespace, "INFO")
+			if ActivePackets[Hash] then ActivePackets[Hash].IsDestroyed = true end
 			Listeners[Hash] = nil
 			local Conn = RemoteConnections[Hash]
 			if Conn then Conn:Disconnect() end
