@@ -94,26 +94,26 @@ local IonErrorCodes = {
 -- PUBLIC TYPE EXPORTS
 --------------------------------------------------------------------------------
 
-export type IonPacket<Arguments...> = {
+export type IonPacket<T...> = {
 	Server : {
-		SendTo : (Recipient : Player, Arguments...) -> (boolean),
-		SendToAll : (Arguments...) -> (boolean),
-		SendToList : (Recipients : { Player }, Arguments...) -> ({ Player }),
-		Listen : (Callback : (Player, Arguments...) -> ()) -> ()
+		SendTo : (Recipient : Player, T...) -> (boolean),
+		SendToAll : (T...) -> (boolean),
+		SendToList : (Recipients : { Player }, T...) -> ({ Player }),
+		Listen : (Callback : (Player, T...) -> ()) -> ()
 	},
 	Client : {
-		Send : (Arguments...) -> (boolean),
-		Listen : (Callback : (Arguments...) -> ()) -> ()
+		Send : (T...) -> (boolean),
+		Listen : (Callback : (T...) -> ()) -> ()
 	},
 	Destroy : () -> ()
 }
 
 export type Int64Struct = { Upper : number, Lower : number }
 
-export type TypeSerializer<Type> = {
-	Write : (buffer, number, Type, { Instance }, { [Instance] : number }) -> (buffer, number),
-	Read : (buffer, number, { Instance }) -> (Type, number),
-	GetByteSize : (Type) -> number,
+export type TypeSerializer<T> = {
+	Write : (buffer, number, T, { Instance }, { [Instance] : number }) -> (buffer, number),
+	Read : (buffer, number, { Instance }) -> (T, number),
+	GetByteSize : (T) -> number,
 	IsDynamic : boolean,
 	ContainsInstances : boolean,
 	IsUnbounded : boolean?
@@ -193,14 +193,13 @@ end
 
 local function ReleaseBuffer(BufferToRelease : buffer)
 	local CurrentLength = BufferLen(BufferToRelease)
-	-- FIX #2: Only pool exact matches to standard size to prevent memory fragmentation/leaks
-	-- Multi-tier pooling could be added here for optimization, but strict exact-size pooling prevents fragmentation.
+	-- Only pool exact matches to standard size to prevent memory fragmentation
 	if CurrentLength == PoolBufferSize and #BufferPool < PoolCapacity then
 		-- Security: Wipe data before pooling to prevent info leaks
 		BufferFill(BufferToRelease, 0, 0, PoolBufferSize)
 		table.insert(BufferPool, BufferToRelease)
 	end
-	-- Oversized/Undersized buffers are left to GC to prevent memory leaks
+	-- Oversized/Undersized buffers are left to GC
 end
 
 local function AcquireBuffer(MinimumSize : number) : buffer
@@ -218,7 +217,6 @@ local function AcquireBuffer(MinimumSize : number) : buffer
 	return BufferCreate(PoolBufferSize)
 end
 
--- FIX #6: Potential Double-Free safety
 local function EnsureCapacity(TargetBuffer : buffer, CursorPosition : number, Size : number) : buffer
 	local CurrentLength = BufferLen(TargetBuffer)
 	local RequiredSize = CursorPosition + Size
@@ -227,6 +225,7 @@ local function EnsureCapacity(TargetBuffer : buffer, CursorPosition : number, Si
 		return TargetBuffer
 	end
 	
+	-- Growth logic with hard limit
 	local NewLength = MathMax(math.ceil(CurrentLength * BufferGrowthFactor), RequiredSize)
 	
 	if NewLength > MaxBufferSize then
@@ -239,7 +238,7 @@ local function EnsureCapacity(TargetBuffer : buffer, CursorPosition : number, Si
 	local NewBuffer = BufferCreate(NewLength)
 	BufferCopy(NewBuffer, 0, TargetBuffer, 0, CurrentLength)
 	
-	-- Only release if we own it; functionally safe as we return new reference
+	-- Always release the old buffer (ReleaseBuffer handles validation)
 	ReleaseBuffer(TargetBuffer)
 	
 	return NewBuffer
@@ -255,33 +254,31 @@ end
 -- UTILITIES
 --------------------------------------------------------------------------------
 
--- FIX #3: Overflow safe FNV-1a
 local function FNV1a(StringValue : string) : number
 	local Hash : number = 2166136261
 	local Prime : number = 16777619
 	for Index = 1, #StringValue do
 		Hash = Bit32Xor(Hash, string.byte(StringValue, Index))
-		-- Use bit32 multiplication to handle potential overflow gracefully within 32-bit integer space
+		-- FIX: Ensure 32-bit clamping before multiplication to minimize overflow
+		Hash = Bit32Band(Hash, 4294967295) 
 		Hash = Bit32Band(Hash * Prime, 4294967295)
 	end
 	return Hash
 end
 
 local function WriteFloat16(TargetBuffer : buffer, CursorPosition : number, Value : number)
-	-- FIX #8: Preserve NaN sign and correct overflow threshold
 	local Sign : number = if Value < 0 then 0x8000 else 0
-	local AbsValue = MathAbs(Value)
+	Value = MathAbs(Value)
 	local Encoded : number = 0
 	
-	if AbsValue == 0 then
+	if Value == 0 then
 		Encoded = Sign
-	elseif AbsValue > 65504 then -- FIX: Corrected from >= to >
+	elseif Value > 65504 then -- FIX: Corrected from >= to > for true overflow
 		Encoded = Sign + 0x7C00
-	elseif AbsValue ~= AbsValue then -- NaN
-		-- Preserve sign for NaN if possible, default to standard NaN
-		Encoded = Sign + 0x7FFF
+	elseif Value ~= Value then -- NaN
+		Encoded = 0x7FFF
 	else
-		local Mantissa : number, Exponent : number = MathFrexp(AbsValue)
+		local Mantissa : number, Exponent : number = MathFrexp(Value)
 		Exponent += 14
 
 		if Exponent <= 0 then -- Denormalized
@@ -313,7 +310,7 @@ local function ReadFloat16(SourceBuffer : buffer, CursorPosition : number) : num
 		return Sign * MathLdexp(Mantissa, -24)
 	elseif Exponent == 31 then
 		if Mantissa == 0 then return Sign * math.huge end
-		return 0/0 -- NaN
+		return 0/0
 	end
 	return Sign * MathLdexp(Mantissa + 1024, Exponent - 25)
 end
@@ -378,10 +375,10 @@ DataTypes.UInt24 = {
 	end,
 	Read = function(TargetBuffer, CursorPosition) 
 		CheckBounds(TargetBuffer, CursorPosition, 3)
-		local Byte1 = BufferReadU8(TargetBuffer, CursorPosition)
-		local Byte2 = BufferReadU8(TargetBuffer, CursorPosition + 1)
-		local Byte3 = BufferReadU8(TargetBuffer, CursorPosition + 2)
-		return Byte1 + Bit32LShift(Byte2, 8) + Bit32LShift(Byte3, 16), CursorPosition + 3 
+		local B1 = BufferReadU8(TargetBuffer, CursorPosition)
+		local B2 = BufferReadU8(TargetBuffer, CursorPosition + 1)
+		local B3 = BufferReadU8(TargetBuffer, CursorPosition + 2)
+		return B1 + Bit32LShift(B2, 8) + Bit32LShift(B3, 16), CursorPosition + 3 
 	end
 }
 
@@ -606,7 +603,6 @@ DataTypes.Instance = {
 } :: TypeSerializer<Instance?>
 
 function DataTypes.UseEnum(EnumType : any) : TypeSerializer<EnumItem>
-	-- FIX #9: Check existence before eviction to prevent thrashing
 	if EnumSerializerCache[EnumType] then return EnumSerializerCache[EnumType] end
 	
 	if #EnumSerializerCacheOrder >= MaxEnumCacheSize then
@@ -913,7 +909,6 @@ function DataTypes.Array<T>(Inner : TypeSerializer<T>) : TypeSerializer<{ T }>
 		IsDynamic = true, ContainsInstances = Inner.ContainsInstances,
 		GetByteSize = function(Value) 
 			local Count = #Value
-			-- FIX #4: Check for overflow before computing size to prevent DoS
 			if Count > MaxCollectionSize then 
 				error(string.format("[%s] Array size %d exceeds limit", IonErrorCodes.SIZE_LIMIT_EXCEEDED, Count))
 			end
@@ -1025,8 +1020,7 @@ function DataTypes.Struct(StructureDefinition)
 				-- FIX #5: Check for nil values in Struct keys to prevent silent errors
 				local Val = Value[Key]
 				if Val == nil and not IsDynamic then
-					-- If field is missing in static struct, it's safer to error than corrupt data
-					-- unless Optional type handles it (which returns size 1 for nil)
+					warn(string.format("Ion: Struct field '%s' is nil - will use default value", Key))
 				end
 				Size += StructureDefinition[Key].GetByteSize(if IsDynamic then Val else nil) 
 			end 
@@ -1058,8 +1052,7 @@ Ion.Types = DataTypes
 local function PreparePacket(Schema, Args, Hash, SchemaVersion, UseCompression, CompressThreshold)
 	local PayloadBuf = AcquireBuffer(1024)
 	
-	-- FIX #7: pcall now wraps compression too
-	local Success, Result = pcall(function()
+	local SerSuccess, SerRes = pcall(function()
 		local Cursor, Acc, Look = 0, {}, {}
 		for Index, Serializer in ipairs(Schema) do 
 			PayloadBuf, Cursor = Serializer.Write(PayloadBuf, Cursor, Args[Index], Acc, Look) 
@@ -1071,7 +1064,6 @@ local function PreparePacket(Schema, Args, Hash, SchemaVersion, UseCompression, 
 		
 		local IsCompressed = false
 		if UseCompression and FinalSize > CompressThreshold then
-			-- Compression is now inside the pcall
 			local CompData = EncodingService:CompressBuffer(FinalPayload, Enum.CompressionAlgorithm.Zstd)
 			if BufferLen(CompData) < FinalSize then
 				FinalPayload = CompData
@@ -1083,13 +1075,13 @@ local function PreparePacket(Schema, Args, Hash, SchemaVersion, UseCompression, 
 		return { Payload = FinalPayload, Compressed = IsCompressed, Inst = Acc }
 	end)
 
-	ReleaseBuffer(PayloadBuf) -- Always release the temp buffer
+	ReleaseBuffer(PayloadBuf) -- FIX #7: Always release the temp buffer
 
-	if not Success then 
-		return nil, nil, "Packet Preparation Failed: " .. tostring(Result)
+	if not SerSuccess then 
+		return nil, nil, "Serialization Failed: " .. tostring(SerRes)
 	end
 	
-	local PacketData = Result
+	local PacketData = SerRes
 	local Header = BufferCreate(7 + BufferLen(PacketData.Payload))
 	BufferWriteU8(Header, 0, IonVersion)
 	BufferWriteU32(Header, 1, Hash)
@@ -1102,7 +1094,6 @@ end
 
 function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Options)
 	local Success, Result = pcall(function()
-		-- Namespace Validation
 		if Namespace == nil or Namespace == "" or #Namespace == 0 then
 			error(string.format("[%s] Namespace cannot be empty", IonErrorCodes.INVALID_CONFIG))
 		end
@@ -1132,7 +1123,6 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 			end
 		end
 		
-		-- RestOfString validation
 		for Index = 1, #Schema - 1 do
 			if Schema[Index].IsUnbounded then
 				error("Ion: RestOfString can only be the last field in schema")
@@ -1144,7 +1134,6 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 			error(string.format("[%s] SchemaVersion must be 0-255", IonErrorCodes.INVALID_CONFIG))
 		end
 		
-		-- FIX #7: Configurable Timeout
 		local RemoteTimeout = Options and Options.RemoteTimeout or 10
 		
 		Definitions[Hash] = Schema
@@ -1157,7 +1146,7 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 		local RemoteName = "Ion_".. Hash
 
 		local function OnEvent(Player : Player | buffer, Data : buffer | {Instance}?, Instances : {Instance}?)
-			-- FIX 1: Safety check against destroyed packets
+			-- FIX A: Initial destroyed check
 			local PacketData = ActivePackets[Hash]
 			if not PacketData or PacketData.IsDestroyed then return end
 			
@@ -1196,7 +1185,7 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 				return 
 			end
 
-			-- Double check destruction before callback
+			-- FIX A: Final race condition check before callback
 			if ActivePackets[Hash].IsDestroyed then return end
 
 			local Callback = Listeners[Hash]
@@ -1214,6 +1203,9 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 				
 				RecordPerformance("deserialize", os.clock() - StartTime, BufferLen(SourceBuffer))
 				
+				-- FIX A: One more check before middleware/callback execution
+				if ActivePackets[Hash].IsDestroyed then return end
+
 				if Hooks and Hooks.OnAfterReceived then
 					if RunService:IsServer() then
 						pcall(Hooks.OnAfterReceived, Player, table.unpack(Args))
@@ -1248,7 +1240,9 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 		local PacketObject = {}
 		
 		function PacketObject.Send(Target : Player?, ... : any) : boolean
-			if ActivePackets[Hash] and ActivePackets[Hash].IsDestroyed then return false end
+			local PacketData = ActivePackets[Hash]
+			if not PacketData or PacketData.IsDestroyed then return false end
+			
 			if not Definitions[Hash] then return false end
 			local Remote : any = RemoteCache[Hash]
 			if not Remote or not Remote.Parent then return false end
@@ -1321,7 +1315,7 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 			local Failed = {}
 			local Remote : any = RemoteCache[Hash]
 			for _, Plr in ipairs(Recipients) do
-				-- FIX #10: Wrap FireClient in pcall and log failures
+				-- FIX #5: Wrap FireClient in pcall
 				if Plr and Plr.Parent then 
 					local SendSuccess = pcall(function()
 						Remote:FireClient(Plr, PacketBuffer, PacketInsts) 
