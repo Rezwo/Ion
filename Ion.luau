@@ -87,6 +87,36 @@ local IonErrorCodes = {
 }
 
 --------------------------------------------------------------------------------
+-- PUBLIC TYPE EXPORTS
+--------------------------------------------------------------------------------
+
+-- This is the type that was missing. It is required for external casting.
+export type IonPacket<T...> = {
+	Server : {
+		SendTo : (Recipient : Player, T...) -> (boolean),
+		SendToAll : (T...) -> (boolean),
+		SendToList : (Recipients : { Player }, T...) -> ({ Player }),
+		Listen : (Callback : (Player, T...) -> ()) -> ()
+	},
+	Client : {
+		Send : (T...) -> (boolean),
+		Listen : (Callback : (T...) -> ()) -> ()
+	},
+	Destroy : () -> ()
+}
+
+export type Int64Struct = { Upper : number, Lower : number }
+
+export type TypeSerializer<T> = {
+	Write : (buffer, number, T, { Instance }, { [Instance] : number }) -> (buffer, number),
+	Read : (buffer, number, { Instance }) -> (T, number),
+	GetByteSize : (T) -> number,
+	IsDynamic : boolean,
+	ContainsInstances : boolean,
+	IsUnbounded : boolean?
+}
+
+--------------------------------------------------------------------------------
 -- STATE & DIAGNOSTICS
 --------------------------------------------------------------------------------
 
@@ -160,10 +190,13 @@ end
 
 local function ReleaseBuffer(BufferToRelease : buffer)
 	local CurrentLength = BufferLen(BufferToRelease)
+	-- Only pool exact matches to standard size to prevent memory fragmentation/leaks
 	if CurrentLength == PoolBufferSize and #BufferPool < PoolCapacity then
+		-- Security: Wipe data before pooling to prevent info leaks
 		BufferFill(BufferToRelease, 0, 0, PoolBufferSize)
 		table.insert(BufferPool, BufferToRelease)
 	end
+	-- Oversized/Undersized buffers are left to GC
 end
 
 local function AcquireBuffer(MinimumSize : number) : buffer
@@ -189,6 +222,7 @@ local function EnsureCapacity(TargetBuffer : buffer, CursorPosition : number, Si
 		return TargetBuffer
 	end
 	
+	-- Growth logic with hard limit
 	local NewLength = MathMax(math.ceil(CurrentLength * BufferGrowthFactor), RequiredSize)
 	
 	if NewLength > MaxBufferSize then
@@ -200,7 +234,10 @@ local function EnsureCapacity(TargetBuffer : buffer, CursorPosition : number, Si
 	
 	local NewBuffer = BufferCreate(NewLength)
 	BufferCopy(NewBuffer, 0, TargetBuffer, 0, CurrentLength)
+	
+	-- Always release the old buffer (ReleaseBuffer handles validation)
 	ReleaseBuffer(TargetBuffer)
+	
 	return NewBuffer
 end
 
@@ -231,15 +268,15 @@ local function WriteFloat16(TargetBuffer : buffer, CursorPosition : number, Valu
 	
 	if Value == 0 then
 		Encoded = Sign
-	elseif Value >= 65504 then
+	elseif Value >= 65504 then -- Infinity/Overflow
 		Encoded = Sign + 0x7C00
-	elseif Value ~= Value then
+	elseif Value ~= Value then -- NaN
 		Encoded = 0x7FFF
 	else
 		local Mantissa : number, Exponent : number = MathFrexp(Value)
 		Exponent += 14
 
-		if Exponent <= 0 then
+		if Exponent <= 0 then -- Denormalized
 			if Exponent < -10 then
 				Encoded = Sign
 			else
@@ -247,9 +284,9 @@ local function WriteFloat16(TargetBuffer : buffer, CursorPosition : number, Valu
 				local MantissaBits = MathClamp(MathFloor(Mantissa + 0.5), 0, 1023)
 				Encoded = Sign + MantissaBits
 			end
-		elseif Exponent >= 31 then
+		elseif Exponent >= 31 then -- Overflow
 			Encoded = Sign + 0x7C00
-		else
+		else -- Normalized
 			local MantissaValue = (Mantissa * 2 - 1) * 1024
 			local MantissaBits = MathClamp(MathFloor(MantissaValue + 0.5), 0, 1023)
 			Encoded = Sign + Bit32LShift(Exponent, 10) + MantissaBits
@@ -290,19 +327,9 @@ end
 -- SERIALIZERS
 --------------------------------------------------------------------------------
 
-export type TypeSerializer<T> = {
-	Write : (buffer, number, T, { Instance }, { [Instance] : number }) -> (buffer, number),
-	Read : (buffer, number, { Instance }) -> (T, number),
-	GetByteSize : (T) -> number,
-	IsDynamic : boolean,
-	ContainsInstances : boolean,
-	IsUnbounded : boolean?
-}
-
-export type Int64Struct = { Upper : number, Lower : number }
-
 local DataTypes = {}
 
+-- Primitives
 local function CreatePrimitive(Size, WriteFunc, ReadFunc, ClampMin, ClampMax)
 	return {
 		IsDynamic = false, ContainsInstances = false,
@@ -343,10 +370,10 @@ DataTypes.UInt24 = {
 	end,
 	Read = function(TargetBuffer, CursorPosition) 
 		CheckBounds(TargetBuffer, CursorPosition, 3)
-		local B1 = BufferReadU8(TargetBuffer, CursorPosition)
-		local B2 = BufferReadU8(TargetBuffer, CursorPosition + 1)
-		local B3 = BufferReadU8(TargetBuffer, CursorPosition + 2)
-		return B1 + Bit32LShift(B2, 8) + Bit32LShift(B3, 16), CursorPosition + 3 
+		local Byte1 = BufferReadU8(TargetBuffer, CursorPosition)
+		local Byte2 = BufferReadU8(TargetBuffer, CursorPosition + 1)
+		local Byte3 = BufferReadU8(TargetBuffer, CursorPosition + 2)
+		return Byte1 + Bit32LShift(Byte2, 8) + Bit32LShift(Byte3, 16), CursorPosition + 3 
 	end
 }
 
@@ -390,11 +417,11 @@ DataTypes.UInt64 = {
 				error(string.format("[%s] UInt64 requires non-negative values", IonErrorCodes.SERIALIZATION_FAILED))
 			end
 		else
-			local N = tonumber(Value) or 0
-			if N < 0 then
+			local NumberValue = tonumber(Value) or 0
+			if NumberValue < 0 then
 				error(string.format("[%s] UInt64 requires non-negative value", IonErrorCodes.SERIALIZATION_FAILED))
 			end
-			Upper, Lower = DecomposeInt64(N)
+			Upper, Lower = DecomposeInt64(NumberValue)
 		end
 		BufferWriteU32(TargetBuffer, CursorPosition, Upper)
 		BufferWriteU32(TargetBuffer, CursorPosition + 4, Lower)
@@ -415,8 +442,8 @@ DataTypes.Int64 = {
 		if type(Value) == "table" then
 			High, Low = Value.Upper or 0, Value.Lower or 0
 		else
-			local N = tonumber(Value) or 0
-			High, Low = DecomposeInt64(N)
+			local NumberValue = tonumber(Value) or 0
+			High, Low = DecomposeInt64(NumberValue)
 		end
 		BufferWriteI32(TargetBuffer, CursorPosition, High)
 		BufferWriteU32(TargetBuffer, CursorPosition + 4, Low)
@@ -665,7 +692,7 @@ DataTypes.CFrameFloat16 = {
 		WriteFloat16(TargetBuffer, CursorPosition + 2, Value.Y)
 		WriteFloat16(TargetBuffer, CursorPosition + 4, Value.Z)
 		local EulerX, EulerY, EulerZ = Value:ToEulerAnglesXYZ()
-		-- FIX #2: Sanitize Euler angles before scaling
+		-- Sanitize Euler angles before scaling
 		local SafeEX = if EulerX == EulerX then EulerX else 0
 		local SafeEY = if EulerY == EulerY then EulerY else 0
 		local SafeEZ = if EulerZ == EulerZ then EulerZ else 0
@@ -676,11 +703,11 @@ DataTypes.CFrameFloat16 = {
 	end,
 	Read = function(TargetBuffer, CursorPosition)
 		CheckBounds(TargetBuffer, CursorPosition, 12)
-		local PX, PY, PZ = ReadFloat16(TargetBuffer, CursorPosition), ReadFloat16(TargetBuffer, CursorPosition + 2), ReadFloat16(TargetBuffer, CursorPosition + 4)
+		local PosX, PosY, PosZ = ReadFloat16(TargetBuffer, CursorPosition), ReadFloat16(TargetBuffer, CursorPosition + 2), ReadFloat16(TargetBuffer, CursorPosition + 4)
 		local EX = BufferReadI16(TargetBuffer, CursorPosition + 6) / EulerScalingFactor
 		local EY = BufferReadI16(TargetBuffer, CursorPosition + 8) / EulerScalingFactor
 		local EZ = BufferReadI16(TargetBuffer, CursorPosition + 10) / EulerScalingFactor
-		return CFrame.fromEulerAnglesXYZ(EX, EY, EZ) + Vector3.new(PX, PY, PZ), CursorPosition + 12
+		return CFrame.fromEulerAnglesXYZ(EX, EY, EZ) + Vector3.new(PosX, PosY, PosZ), CursorPosition + 12
 	end
 }
 
@@ -690,7 +717,7 @@ DataTypes.CFrame = {
 	Write = function(TargetBuffer, CursorPosition, Value)
 		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 24)
 		local Axis, Angle = Value:ToAxisAngle()
-		-- FIX #1: Check ALL components for NaN
+		-- Check ALL components for NaN
 		local HasNaN = Angle ~= Angle or Axis.X ~= Axis.X or Axis.Y ~= Axis.Y or Axis.Z ~= Axis.Z
 		local Rot = if HasNaN then Vector3.zero else Axis * Angle
 		BufferWriteF32(TargetBuffer, CursorPosition, Value.X)
@@ -891,7 +918,7 @@ function DataTypes.Array<T>(Inner : TypeSerializer<T>) : TypeSerializer<{ T }>
 		end,
 		Write = function(TargetBuffer, CursorPosition, Value, InstanceAccumulator, InstanceLookup)
 			local Count = #Value
-			-- FIX #3: Check size BEFORE iteration
+			-- Check size BEFORE iteration
 			if Count > MaxCollectionSize then error(string.format("[%s] Array size %d exceeds limit", IonErrorCodes.SIZE_LIMIT_EXCEEDED, Count)) end
 			
 			TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 4)
@@ -935,7 +962,7 @@ function DataTypes.Map<K, V>(KeyType : TypeSerializer<K>, ValType : TypeSerializ
 		Write = function(TargetBuffer, CursorPosition, Value, InstanceAccumulator, InstanceLookup)
 			local Count = 0
 			for _ in pairs(Value) do Count += 1 end
-			-- FIX #4: Check size BEFORE iteration
+			-- Check size BEFORE iteration
 			if Count > MaxCollectionSize then error(string.format("[%s] Map size %d exceeds limit", IonErrorCodes.SIZE_LIMIT_EXCEEDED, Count)) end
 			
 			TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 4)
@@ -1057,7 +1084,7 @@ end
 
 function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Options)
 	local Success, Result = pcall(function()
-		-- FIX #8: Namespace Validation
+		-- Namespace Validation
 		if Namespace == nil or Namespace == "" or #Namespace == 0 then
 			error(string.format("[%s] Namespace cannot be empty", IonErrorCodes.INVALID_CONFIG))
 		end
@@ -1068,7 +1095,7 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 
 		local Hash = FNV1a(Namespace)
 		
-		-- FIX #6: Improved Collision Detection
+		-- Improved Collision Detection
 		if Definitions[Hash] then
 			local Existing = ActivePackets[Hash]
 			if Existing and Existing.Namespace == Namespace then
@@ -1083,7 +1110,7 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 			end
 		end
 		
-		-- FIX #7: RestOfString validation
+		-- RestOfString validation
 		for Index = 1, #Schema - 1 do
 			if Schema[Index].IsUnbounded then
 				error("Ion: RestOfString can only be the last field in schema")
@@ -1110,7 +1137,7 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 			local CursorPosition = 0
 			local StartTime = os.clock()
 			
-			-- FIX #4 & #5: Capture success, result, AND message
+			-- Capture success, result, AND message
 			local DeserializeSuccess, ValidationResult, ErrorMessage = pcall(function()
 				CheckBounds(SourceBuffer, CursorPosition, 7)
 				local Ver = BufferReadU8(SourceBuffer, CursorPosition)
