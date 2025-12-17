@@ -824,7 +824,7 @@ DataTypes.Any = {
 		elseif T == "UDim2" then return 17
 		elseif T == "DateTime" then return 9
 		elseif T == "buffer" then return 5 + BufferLen(Value)
-		else return 1 end -- Nil
+		else return 1 end
 	end,
 	Write = function(TargetBuffer, CursorPosition, Value, InstanceAccumulator, InstanceLookup)
 		local T = typeof(Value)
