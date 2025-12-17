@@ -60,6 +60,7 @@ local IonVersion : number = 1
 local MaxPacketSize : number = 900
 local MaxBufferSize : number = 100 * 1024 * 1024 -- 100MB Hard Limit
 local MaxBufferBlobSize : number = 10 * 1024 * 1024 -- 10MB Limit for single Blob/String
+local BufferGrowthFactor : number = 1.5
 local MaxCollectionSize : number = 100000 -- 100k items limit
 local MaxStringSize : number = 1000000 -- 1MB string limit
 local CompressionThreshold : number = 128 -- Bytes
@@ -88,7 +89,8 @@ local IonErrorCodes = {
 	NOT_SUPPORTED = "E014",
 	INVALID_CONFIG = "E015",
 	REMOTE_MISSING = "E016",
-	TIMEOUT = "E017"
+	TIMEOUT = "E017",
+	RATE_LIMITED = "E018"
 }
 
 --------------------------------------------------------------------------------
@@ -120,6 +122,19 @@ export type TypeSerializer<T> = {
 	IsUnbounded : boolean?
 }
 
+export type IonDefinitionOptions = {
+	Unreliable : boolean?,
+	Compress : boolean?,
+	CompressionThreshold : number?,
+	SchemaVersion : number?,
+	RemoteTimeout : number?,
+	RateLimit : { MaxRequests : number, Window : number }?,
+	Middleware : {
+		OnBeforeSend : ((...any) -> (boolean | {any} | nil))?,
+		OnAfterReceived : ((...any) -> ())?
+	}?
+}
+
 --------------------------------------------------------------------------------
 -- STATE & DIAGNOSTICS
 --------------------------------------------------------------------------------
@@ -134,11 +149,23 @@ local AnyEnumCache : { [any] : { [number] : EnumItem } } = {}
 local AnyEnumCacheOrder : { any } = {}
 
 -- Packet Tracking
+type PacketMetadata = {
+	Namespace : string,
+	Created : number,
+	IsDestroyed : boolean,
+	Generation : number,
+	RateLimitState : {
+		History : { number },
+		WindowStart : number
+	}?
+}
+
 local Definitions : { [number] : any } = {}
 local Listeners : { [number] : (...any) -> () } = {}
 local RemoteCache : { [number] : RemoteEvent | UnreliableRemoteEvent } = {}
 local RemoteConnections : { [number] : RBXScriptConnection } = {}
-local ActivePackets : { [number] : { Namespace: string, Created: number, IsDestroyed: boolean } } = {}
+local ActivePackets : { [number] : PacketMetadata } = {}
+local HashGenerations : { [number] : number } = {}
 
 local DebugMode = false
 local DebugLogger : ((message: string, level: string) -> ())? = nil
@@ -194,13 +221,10 @@ end
 
 local function ReleaseBuffer(BufferToRelease : buffer)
 	local CurrentLength = BufferLen(BufferToRelease)
-	-- Only pool exact matches to standard size to prevent memory fragmentation
 	if CurrentLength == PoolBufferSize and #BufferPool < PoolCapacity then
-		-- Security: Wipe data before pooling to prevent info leaks
 		BufferFill(BufferToRelease, 0, 0, PoolBufferSize)
 		table.insert(BufferPool, BufferToRelease)
 	end
-	-- Oversized/Undersized buffers are left to GC
 end
 
 local function AcquireBuffer(MinimumSize : number) : buffer
@@ -218,7 +242,6 @@ local function AcquireBuffer(MinimumSize : number) : buffer
 	return BufferCreate(PoolBufferSize)
 end
 
--- FIX #6: Power-of-2 growth strategy
 local function EnsureCapacity(TargetBuffer : buffer, CursorPosition : number, Size : number) : buffer
 	local CurrentLength = BufferLen(TargetBuffer)
 	local RequiredSize = CursorPosition + Size
@@ -240,7 +263,6 @@ local function EnsureCapacity(TargetBuffer : buffer, CursorPosition : number, Si
 	local NewBuffer = BufferCreate(NewLength)
 	BufferCopy(NewBuffer, 0, TargetBuffer, 0, CurrentLength)
 	
-	-- Always release the old buffer (ReleaseBuffer handles validation)
 	ReleaseBuffer(TargetBuffer)
 	
 	return NewBuffer
@@ -261,8 +283,7 @@ local function FNV1a(StringValue : string) : number
 	local Prime : number = 16777619
 	for Index = 1, #StringValue do
 		Hash = Bit32Xor(Hash, string.byte(StringValue, Index))
-		-- Ensure 32-bit clamping before multiplication to minimize overflow
-		Hash = Bit32Band(Hash, 4294967295) 
+		Hash = Bit32Band(Hash, 4294967295) -- Ensure 32-bit before multiply
 		Hash = Bit32Band(Hash * Prime, 4294967295)
 	end
 	return Hash
@@ -275,7 +296,7 @@ local function WriteFloat16(TargetBuffer : buffer, CursorPosition : number, Valu
 	
 	if Value == 0 then
 		Encoded = Sign
-	elseif Value > 65504 then -- Corrected from >= to > for true overflow
+	elseif Value > 65504 then
 		Encoded = Sign + 0x7C00
 	elseif Value ~= Value then -- NaN
 		Encoded = 0x7FFF
@@ -574,6 +595,9 @@ function DataTypes.Optional<T>(Inner : TypeSerializer<T>) : TypeSerializer<T?>
 	}
 end
 
+-- WARNING: Instance references can become invalid between serialization and receipt.
+-- The receiver may get nil if the instance is removed from the game tree.
+-- Always validate instances on the receiving end.
 DataTypes.Instance = {
 	IsDynamic = false, ContainsInstances = true,
 	GetByteSize = function(_) return 2 end,
@@ -1101,7 +1125,23 @@ local function PreparePacket(Schema, Args, Hash, SchemaVersion, UseCompression, 
 	return Header, PacketData.Inst, nil
 end
 
-function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Options)
+local function GetStubPacket()
+	return {
+		Server = {
+			SendTo = function(...) return false end,
+			SendToAll = function(...) return false end,
+			SendToList = function(R) return R end,
+			Listen = function(...) end
+		},
+		Client = {
+			Send = function(...) return false end,
+			Listen = function(...) end
+		},
+		Destroy = function() end
+	}
+end
+
+function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Options : IonDefinitionOptions?)
 	local Success, Result = pcall(function()
 		if Namespace == nil or Namespace == "" or #Namespace == 0 then
 			error(string.format("[%s] Namespace cannot be empty", IonErrorCodes.INVALID_CONFIG))
@@ -1151,8 +1191,21 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 		-- FIX #2: Configurable Timeout
 		local RemoteTimeout = Options and Options.RemoteTimeout or 10
 		
+		-- Rate Limiter Setup (FIX #5)
+		local RateLimitConfig = Options and Options.RateLimit
+		local RateLimitState = if RateLimitConfig then {
+			History = {},
+			WindowStart = 0
+		} else nil
+		
 		Definitions[Hash] = Schema
-		ActivePackets[Hash] = { Namespace = Namespace, Created = os.time(), IsDestroyed = false }
+		ActivePackets[Hash] = { 
+			Namespace = Namespace, 
+			Created = os.time(), 
+			IsDestroyed = false,
+			Generation = 1,
+			RateLimitState = RateLimitState
+		}
 		
 		local IsUnreliable = Options and Options.Unreliable or false
 		local UseCompression = Options and Options.Compress or false
@@ -1190,6 +1243,7 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 					BufferCopy(CompPayload, 0, SourceBuffer, 7, CompSize)
 					
 					local DecompSuccess, DecompResult = pcall(EncodingService.DecompressBuffer, EncodingService, CompPayload, Enum.CompressionAlgorithm.Zstd)
+					-- FIX 3: Added correct error code for decompression failure
 					if not DecompSuccess then error(string.format("[%s] Decompression failed: %s", IonErrorCodes.DECOMPRESSION_FAILED, tostring(DecompResult))) end
 					
 					SourceBuffer = DecompResult
@@ -1248,14 +1302,18 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 		else
 			local Remote = ReplicatedStorage:WaitForChild(RemoteName, RemoteTimeout)
 			if not Remote then
+				-- Fallback polling if WaitForChild times out (rare but possible with streaming)
 				local Retries = 0
 				while not Remote and Retries < 5 do
 					Retries += 1
 					Remote = ReplicatedStorage:WaitForChild(RemoteName, 2)
 				end
 			end
-			-- FIX 2: Safer client error
-			if not Remote then error(string.format("[%s] Remote missing for %s", IonErrorCodes.REMOTE_MISSING, Namespace)) end
+			-- FIX 2: Safer client error - return stub instead of crashing
+			if not Remote then 
+				warn(string.format("[%s] Remote missing for %s - packet will be non-functional", IonErrorCodes.REMOTE_MISSING, Namespace))
+				return GetStubPacket()
+			end
 			RemoteCache[Hash] = Remote
 			RemoteConnections[Hash] = (Remote :: any).OnClientEvent:Connect(OnEvent)
 		end
@@ -1266,6 +1324,33 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 			local PacketData = ActivePackets[Hash]
 			if not PacketData or PacketData.IsDestroyed then return false end
 			
+			-- FIX #5: Rate Limiting
+			if RateLimitConfig and PacketData.RateLimitState then
+				local Now = os.clock()
+				local State = PacketData.RateLimitState
+				
+				-- Sliding Window Reset
+				if Now - State.WindowStart > RateLimitConfig.Window then
+					State.History = {}
+					State.WindowStart = Now
+				end
+				
+				-- Cleanup old entries
+				local Cutoff = Now - RateLimitConfig.Window
+				for i = #State.History, 1, -1 do
+					if State.History[i] < Cutoff then
+						table.remove(State.History, i)
+					end
+				end
+				
+				if #State.History >= RateLimitConfig.MaxRequests then
+					warn(string.format("[%s] Rate limit exceeded for %s", IonErrorCodes.SIZE_LIMIT_EXCEEDED, Namespace))
+					return false
+				end
+				
+				table.insert(State.History, Now)
+			end
+
 			if not Definitions[Hash] then return false end
 			local Remote : any = RemoteCache[Hash]
 			if not Remote or not Remote.Parent then return false end
@@ -1278,14 +1363,29 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 					warn("Ion Middleware Error: " .. tostring(MiddlewareResult)) 
 					return false 
 				end
-				if MiddlewareResult == false then return false end
-				if type(MiddlewareResult) == "table" then Args = MiddlewareResult end
+				
+				-- Strict return type handling
+				if MiddlewareResult == false then 
+					return false 
+				elseif type(MiddlewareResult) == "table" then 
+					Args = MiddlewareResult 
+				elseif MiddlewareResult ~= nil and MiddlewareResult ~= true then
+					warn(string.format("Ion: OnBeforeSend returned unexpected type '%s' - ignoring", type(MiddlewareResult)))
+				end
 			end
 
 			if IsUnreliable then
 				local EstSize = 7
+				local InstanceCount = 0
 				local SizeCheckSuccess = pcall(function() 
-					for Index, Serializer in ipairs(Schema) do EstSize += Serializer.GetByteSize(Args[Index]) end 
+					for Index, Serializer in ipairs(Schema) do 
+						EstSize += Serializer.GetByteSize(Args[Index])
+						-- FIX #4: Better estimation including instance overhead
+						if Serializer.ContainsInstances then
+							InstanceCount += 1
+						end
+					end 
+					EstSize += InstanceCount * 10 -- Approx 10 bytes overhead per instance ref
 				end)
 				
 				if not SizeCheckSuccess then 
@@ -1297,6 +1397,7 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 					EstSize = math.ceil(EstSize * CompressionRatioEstimate) 
 				end
 				
+				-- Strict enforcement of packet size for unreliable packets
 				if EstSize > MaxPacketSize then 
 					warn(string.format("[%s] Packet likely too large (%d bytes)", IonErrorCodes.SIZE_LIMIT_EXCEEDED, EstSize))
 					return false 
@@ -1325,7 +1426,6 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 		end
 
 		function PacketObject.SendToList(Recipients, ...)
-			-- FIX 6: Validate Recipients
 			if type(Recipients) ~= "table" then
 				warn("Ion: SendToList recipients must be a table")
 				return {}
@@ -1333,10 +1433,19 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 			if #Recipients == 0 then return {} end
 			
 			local Args = table.pack(...)
+			-- FIX #6: SendToList middleware context limitation
 			if Hooks and Hooks.OnBeforeSend then
 				local MiddlewareSuccess, MiddlewareResult = pcall(Hooks.OnBeforeSend, ...)
-				if not MiddlewareSuccess or MiddlewareResult == false then return Recipients end
-				if type(MiddlewareResult) == "table" then Args = MiddlewareResult end
+				if not MiddlewareSuccess then 
+					warn("Ion Middleware Error: " .. tostring(MiddlewareResult)) 
+					return Recipients 
+				end
+				
+				if MiddlewareResult == false then 
+					return Recipients 
+				elseif type(MiddlewareResult) == "table" then 
+					Args = MiddlewareResult 
+				end
 			end
 			
 			local PacketBuffer, PacketInsts, Err = PreparePacket(Schema, Args, Hash, SchemaVersion, UseCompression, CompressThreshold)
@@ -1347,6 +1456,7 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 			local Failed = {}
 			local Remote : any = RemoteCache[Hash]
 			for _, Plr in ipairs(Recipients) do
+				-- FIX #5: Wrap FireClient in pcall
 				if Plr and Plr.Parent then 
 					local SendSuccess = pcall(function()
 						Remote:FireClient(Plr, PacketBuffer, PacketInsts) 
