@@ -88,12 +88,13 @@ export type IonPacket<Arguments...> = {
 	Server : {
 		SendTo : (Recipient : Player, Arguments...) -> (boolean),
 		SendToAll : (Arguments...) -> (boolean),
+		SendToAllExcept : (Excluded : Player | { Player }, Arguments...) -> (boolean),
 		SendToList : (Recipients : { Player }, Arguments...) -> ({ Player }),
-		Listen : (Callback : (Player, Arguments...) -> ()) -> ()
+		Listen : (Callback : (Player, Arguments...) -> ()) -> ({ Disconnect: () -> () }) 
 	},
 	Client : {
 		Send : (Arguments...) -> (boolean),
-		Listen : (Callback : (Arguments...) -> ()) -> ()
+		Listen : (Callback : (Arguments...) -> ()) -> ({ Disconnect: () -> () })
 	},
 	Destroy : () -> ()
 }
@@ -1086,12 +1087,13 @@ local function GetStubPacket()
 		Server = {
 			SendTo = function(...) return false end,
 			SendToAll = function(...) return false end,
+			SendToAllExcept = function(...) return false end,
 			SendToList = function(R: { Player }, ...: any): { Player } return R end,
-			Listen = function(...) end
+			Listen = function(...) return { Disconnect = function() end } end
 		},
 		Client = {
 			Send = function(...) return false end,
-			Listen = function(...) end
+			Listen = function(...) return { Disconnect = function() end } end
 		},
 		Destroy = function() end
 	}
@@ -1303,6 +1305,47 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 		end
 
 		local PacketObject = {}
+		
+		function PacketObject.SendToAllExcept(Excluded: Player | { Player }, ... : any) : boolean
+			local PacketData = ActivePackets[Hash]
+			if not PacketData or PacketData.IsDestroyed then return false end
+
+			local Remote : any = RemoteCache[Hash]
+			if not Remote or not Remote.Parent then return false end
+
+			local ExcludedMap = {}
+			if typeof(Excluded) == "Instance" then
+				ExcludedMap[Excluded] = true
+			elseif type(Excluded) == "table" then
+				for _, p in ipairs(Excluded) do
+					ExcludedMap[p] = true
+				end
+			end
+
+			local Args = table.pack(...)
+
+			if Hooks and Hooks.OnBeforeSend then
+				local MiddlewareSuccess, MiddlewareResult = pcall(Hooks.OnBeforeSend, ...)
+				if not MiddlewareSuccess then return false end
+				if MiddlewareResult == false then return false end
+				if type(MiddlewareResult) == "table" then Args = MiddlewareResult end
+			end
+
+			local StartTime = os.clock()
+			local PacketBuffer, PacketInsts, Err = PreparePacket(Schema, Args, Hash, SchemaVersion, UseCompression, CompressThreshold)
+			if not PacketBuffer then return false end
+
+			if IsUnreliable and BufferLen(PacketBuffer) > MaxPacketSize then return false end
+			RecordPerformance("serialize", os.clock() - StartTime, BufferLen(PacketBuffer))
+
+			for _, Player in (Players:GetPlayers()) do
+				if not ExcludedMap[Player] then
+					Remote:FireClient(Player, PacketBuffer, PacketInsts)
+				end
+			end
+
+			return true
+		end
 
 		function PacketObject.Send(Target : Player?, ... : any) : boolean
 			local PacketData = ActivePackets[Hash]
@@ -1339,9 +1382,9 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 				end
 
 				local Cutoff = Now - RateLimitConfig.Window
-				for i = #State.History, 1, -1 do
-					if State.History[i] < Cutoff then
-						table.remove(State.History, i)
+				for Index = #State.History, 1, -1 do
+					if State.History[Index] < Cutoff then
+						table.remove(State.History, Index)
 					end
 				end
 
@@ -1447,7 +1490,17 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 			return Failed
 		end
 
-		function PacketObject.Listen(Callback) Listeners[Hash] = Callback end
+		function PacketObject.Listen(Callback) 
+			Listeners[Hash] = Callback 
+
+			return {
+				Disconnect = function()
+					if Listeners[Hash] == Callback then
+						Listeners[Hash] = nil
+					end
+				end
+			}
+		end
 
 		function PacketObject.Destroy()
 			local PacketData = ActivePackets[Hash]
@@ -1470,8 +1523,17 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 		end
 
 		return {
-			Server = { SendTo = function(Player,...) return PacketObject.Send(Player,...) end, SendToAll = function(...) return PacketObject.Send(nil,...) end, SendToList = PacketObject.SendToList, Listen = PacketObject.Listen },
-			Client = { Send = function(...) return PacketObject.Send(nil,...) end, Listen = PacketObject.Listen },
+			Server = { 
+				SendTo = function(Player,...) return PacketObject.Send(Player,...) end, 
+				SendToAll = function(...) return PacketObject.Send(nil,...) end, 
+				SendToAllExcept = PacketObject.SendToAllExcept,
+				SendToList = PacketObject.SendToList, 
+				Listen = PacketObject.Listen 
+			},
+			Client = { 
+				Send = function(...) return PacketObject.Send(nil,...) end, 
+				Listen = PacketObject.Listen
+			},
 			Destroy = PacketObject.Destroy
 		}
 	end)
