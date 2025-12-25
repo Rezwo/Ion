@@ -62,6 +62,8 @@ local PoolBufferSize : number = 4096
 local MaxSafeInteger : number = 9007199254740991
 local EulerScalingFactor : number = 10430.0 
 local MaxEnumCacheSize : number = 500
+local MaxQueueSize : number = 500
+local QueueTimeout : number = 30
 
 local IonErrorCodes = {
 	BUFFER_OVERFLOW = "E001",
@@ -81,7 +83,8 @@ local IonErrorCodes = {
 	INVALID_CONFIG = "E015",
 	REMOTE_MISSING = "E016",
 	TIMEOUT = "E017",
-	RATE_LIMITED = "E018"
+	RATE_LIMITED = "E018",
+	QUEUE_FULL = "E019"
 }
 
 export type IonPacket<Arguments...> = {
@@ -154,7 +157,9 @@ type PacketMetadata = {
 type QueuedPacket = {
 	Hash: number,
 	Buffer: buffer,
-	Instances: { Instance }?
+	Instances: { Instance }?,
+	Timestamp: number,
+	IsReliable: boolean
 }
 
 local Definitions : { [number] : any } = {}
@@ -163,11 +168,11 @@ local RemoteCache : { [number] : RemoteEvent | UnreliableRemoteEvent } = {}
 local RemoteConnections : { [number] : RBXScriptConnection } = {}
 local ActivePackets : { [number] : PacketMetadata } = {}
 
--- Client Initialization State
 local PlayerReadyState : { [Player] : boolean } = {}
 local PacketQueue : { [Player] : { QueuedPacket } } = {}
 local HandshakeRemote : RemoteEvent? = nil
 local HandshakeName = "Ion_Internal_Handshake"
+local ClientAutoInit = false
 
 local DebugMode = false
 local DebugLogger : ((message: string, level: string) -> ())? = nil
@@ -182,7 +187,8 @@ local PerformanceStats = {
 	BufferPoolHits = 0,
 	BufferPoolMisses = 0,
 	CompressionSavings = 0,
-	PacketsQueued = 0
+	PacketsQueued = 0,
+	PacketsDroppedQueue = 0
 }
 
 local function DebugLog(Message : string, Level : string?)
@@ -1058,34 +1064,49 @@ end
 local Ion = {}
 Ion.Types = DataTypes
 
--- Initialize Handshake Remote on Server
 if RunService:IsServer() then
 	local Remote = Instance.new("RemoteEvent")
 	Remote.Name = HandshakeName
 	Remote.Parent = ReplicatedStorage
 	HandshakeRemote = Remote
-	
+
 	local function FlushQueue(Player: Player)
 		local Queue = PacketQueue[Player]
-		if not Queue then return end
-		
+		if not Queue or #Queue == 0 then return end
+
+		local Now = os.clock()
+		local FlushedCount = 0
+		local DroppedCount = 0
+
 		for _, Item in ipairs(Queue) do
+			if Now - Item.Timestamp > QueueTimeout then
+				DroppedCount += 1
+				continue
+			end
+
+			if not Item.IsReliable then
+				DroppedCount += 1
+				continue
+			end
+
 			local PacketDef = ActivePackets[Item.Hash]
 			if PacketDef and not PacketDef.IsDestroyed then
 				local RemoteObj = RemoteCache[Item.Hash]
-				if RemoteObj and RemoteObj:IsA("RemoteEvent") then -- Unreliable are skipped if queued? No, we send all.
-					-- Note: Unreliable packets in queue are sent as reliable (RemoteEvent) to ensure order? 
-					-- Actually, we must use the original remote.
-					if RemoteObj:IsA("UnreliableRemoteEvent") then
-						RemoteObj:FireClient(Player, Item.Buffer, Item.Instances)
-					else
+				if RemoteObj and RemoteObj:IsA("RemoteEvent") then
+					pcall(function()
 						(RemoteObj :: RemoteEvent):FireClient(Player, Item.Buffer, Item.Instances)
-					end
+					end)
+					FlushedCount += 1
 				end
 			end
 		end
-		
+
 		PacketQueue[Player] = nil
+
+		if DroppedCount > 0 then
+			DebugLog(string.format("Dropped %d queued packets for %s (expired/unreliable)", DroppedCount, Player.Name), "INFO")
+		end
+		DebugLog(string.format("Flushed %d packets for %s", FlushedCount, Player.Name), "INFO")
 	end
 
 	Remote.OnServerEvent:Connect(function(Player)
@@ -1098,6 +1119,48 @@ if RunService:IsServer() then
 	Players.PlayerRemoving:Connect(function(Player)
 		PlayerReadyState[Player] = nil
 		PacketQueue[Player] = nil
+	end)
+
+	task.spawn(function()
+		while true do
+			task.wait(5)
+			local Now = os.clock()
+			for Player, Queue in pairs(PacketQueue) do
+				if not PlayerReadyState[Player] then
+					for i = #Queue, 1, -1 do
+						if Now - Queue[i].Timestamp > QueueTimeout then
+							table.remove(Queue, i)
+						end
+					end
+					while #Queue > MaxQueueSize do
+						table.remove(Queue, 1)
+					end
+				end
+			end
+		end
+	end)
+end
+
+local function EnsureClientReady()
+	if RunService:IsServer() or ClientAutoInit then return end
+	ClientAutoInit = true
+
+	task.spawn(function()
+		local Player = Players.LocalPlayer :: Player
+		local Handshake = ReplicatedStorage:WaitForChild(HandshakeName, 10) :: RemoteEvent
+		if not Handshake then
+			warn("Ion: Handshake remote missing - packets may be delayed")
+			return
+		end
+
+		if not Player.Character then
+			Player.CharacterAdded:Wait()
+		end
+
+		task.wait(0.1)
+
+		Handshake:FireServer()
+		DebugLog("Client auto-marked as Ready", "INFO")
 	end)
 end
 
@@ -1167,7 +1230,13 @@ function Ion.ConfigureClient(Config: ClientConfig)
 		return
 	end
 
-	local Player = Players.LocalPlayer
+	if ClientAutoInit then
+		warn("Ion: Client already initialized")
+		return
+	end
+	ClientAutoInit = true
+
+	local Player = Players.LocalPlayer :: Player
 	local Handshake = ReplicatedStorage:WaitForChild(HandshakeName, 10)
 	if not Handshake then
 		warn("Ion: Handshake remote missing. Client ready state will not be sent.")
@@ -1178,7 +1247,7 @@ function Ion.ConfigureClient(Config: ClientConfig)
 		local Timeout = Config.WaitForTimeout or 30
 		local StartTime = os.clock()
 
-		if Config.WaitForCharacter ~= false then -- Default true
+		if Config.WaitForCharacter ~= false then
 			if not Player.Character then
 				Player.CharacterAdded:Wait()
 			end
@@ -1200,6 +1269,8 @@ function Ion.ConfigureClient(Config: ClientConfig)
 end
 
 function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Options : IonDefinitionOptions?): IonPacket<...any>
+	EnsureClientReady()
+
 	local Success, Result = pcall(function()
 		if (Namespace :: any) == nil or Namespace == "" or #Namespace == 0 then
 			error(string.format("[%s] Namespace cannot be empty", IonErrorCodes.INVALID_CONFIG))
@@ -1405,7 +1476,7 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 		end
 
 		local PacketObject = {}
-		
+
 		function PacketObject.SendToAllExcept(Excluded: Player | { Player }, ... : any) : boolean
 			local PacketData = ActivePackets[Hash]
 			if not PacketData or PacketData.IsDestroyed then return false end
@@ -1443,10 +1514,21 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 					if PlayerReadyState[Player] then
 						Remote:FireClient(Player, PacketBuffer, PacketInsts)
 					else
-						-- Queue packet
-						if not PacketQueue[Player] then PacketQueue[Player] = {} end
-						table.insert(PacketQueue[Player], { Hash = Hash, Buffer = PacketBuffer, Instances = PacketInsts })
-						PerformanceStats.PacketsQueued += 1
+						if not IsUnreliable then
+							if not PacketQueue[Player] then PacketQueue[Player] = {} end
+							if #PacketQueue[Player] < MaxQueueSize then
+								table.insert(PacketQueue[Player], { 
+									Hash = Hash, 
+									Buffer = PacketBuffer, 
+									Instances = PacketInsts,
+									Timestamp = os.clock(),
+									IsReliable = true
+								})
+								PerformanceStats.PacketsQueued += 1
+							else
+								PerformanceStats.PacketsDroppedQueue += 1
+							end
+						end
 					end
 				end
 			end
@@ -1549,20 +1631,47 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 					if PlayerReadyState[Target] then
 						Remote:FireClient(Target, PacketBuffer, PacketInsts)
 					else
+						if IsUnreliable then
+							DebugLog("Dropping unreliable packet for unready client", "DEBUG")
+							return false
+						end
+
 						if not PacketQueue[Target] then PacketQueue[Target] = {} end
-						table.insert(PacketQueue[Target], { Hash = Hash, Buffer = PacketBuffer, Instances = PacketInsts })
+						if #PacketQueue[Target] >= MaxQueueSize then
+							warn(string.format("Ion: Queue full for %s, dropping packet", Target.Name))
+							PerformanceStats.PacketsDroppedQueue += 1
+							return false
+						end
+
+						table.insert(PacketQueue[Target], { 
+							Hash = Hash, 
+							Buffer = PacketBuffer, 
+							Instances = PacketInsts,
+							Timestamp = os.clock(),
+							IsReliable = true
+						})
 						PerformanceStats.PacketsQueued += 1
 					end
 				else
-					-- SendToAll (Target is nil)
-					-- Optimize by sending to all ready players, queueing for others
 					for _, Player in ipairs(Players:GetPlayers()) do
 						if PlayerReadyState[Player] then
 							Remote:FireClient(Player, PacketBuffer, PacketInsts)
 						else
-							if not PacketQueue[Player] then PacketQueue[Player] = {} end
-							table.insert(PacketQueue[Player], { Hash = Hash, Buffer = PacketBuffer, Instances = PacketInsts })
-							PerformanceStats.PacketsQueued += 1
+							if not IsUnreliable then
+								if not PacketQueue[Player] then PacketQueue[Player] = {} end
+								if #PacketQueue[Player] < MaxQueueSize then
+									table.insert(PacketQueue[Player], { 
+										Hash = Hash, 
+										Buffer = PacketBuffer, 
+										Instances = PacketInsts,
+										Timestamp = os.clock(),
+										IsReliable = true
+									})
+									PerformanceStats.PacketsQueued += 1
+								else
+									PerformanceStats.PacketsDroppedQueue += 1
+								end
+							end
 						end
 					end
 				end
@@ -1612,10 +1721,23 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 							table.insert(Failed, Player)
 						end
 					else
-						-- Queue
-						if not PacketQueue[Player] then PacketQueue[Player] = {} end
-						table.insert(PacketQueue[Player], { Hash = Hash, Buffer = PacketBuffer, Instances = PacketInsts })
-						PerformanceStats.PacketsQueued += 1
+						if not IsUnreliable then
+							if not PacketQueue[Player] then PacketQueue[Player] = {} end
+							if #PacketQueue[Player] < MaxQueueSize then
+								table.insert(PacketQueue[Player], { 
+									Hash = Hash, 
+									Buffer = PacketBuffer, 
+									Instances = PacketInsts,
+									Timestamp = os.clock(),
+									IsReliable = true
+								})
+								PerformanceStats.PacketsQueued += 1
+							else
+								PerformanceStats.PacketsDroppedQueue += 1
+							end
+						else
+							DebugLog("Unreliable packet dropped: " .. tostring(Hash), "WARN")
+						end
 					end
 				else 
 					table.insert(Failed, Player :: Player) 
