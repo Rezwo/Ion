@@ -225,28 +225,27 @@ end
 local function EnsureCapacity(TargetBuffer : buffer, CursorPosition : number, Size : number) : buffer
 	local CurrentLength = BufferLen(TargetBuffer)
 	local RequiredSize = CursorPosition + Size
-	if RequiredSize <= CurrentLength then return TargetBuffer end
 
-	local NewLength = CurrentLength
-	if NewLength == 0 then NewLength = 1 end
-	while NewLength < RequiredSize do
-		NewLength = NewLength * 2
-		if NewLength >= MaxBufferSize then
-			NewLength = MaxBufferSize
-			break
-		end
+	if RequiredSize <= CurrentLength then
+		return TargetBuffer
 	end
 
-	if NewLength < RequiredSize then
-		error(string.format("[%s] Ion: Buffer overflow - Required %d > Max %d", IonErrorCodes.BUFFER_OVERFLOW, RequiredSize, MaxBufferSize))
+	local NewLength = 2 ^ MathCeil(MathLog(RequiredSize, 2))
+
+	if NewLength > MaxBufferSize then
+		if RequiredSize > MaxBufferSize then
+			error(string.format("[%s] Ion: Buffer overflow - Required %d > Max %d", IonErrorCodes.BUFFER_OVERFLOW, RequiredSize, MaxBufferSize))
+		end
+		NewLength = MaxBufferSize
 	end
 
 	local NewBuffer = BufferCreate(NewLength)
 	BufferCopy(NewBuffer, 0, TargetBuffer, 0, CurrentLength)
+
 	ReleaseBuffer(TargetBuffer)
+
 	return NewBuffer
 end
-
 
 local function CheckBounds(TargetBuffer : buffer, CursorPosition : number, Size : number)
 	if CursorPosition + Size > BufferLen(TargetBuffer) then
@@ -325,55 +324,6 @@ local function DecomposeInt64(Value : number) : (number, number)
 		Low += 4294967296
 	end
 	return High, Low
-end
-
-local function ZigZagEncode(n : number) : number
-    if n >= 0 then
-        return n * 2
-    else
-        return (-n) * 2 - 1
-    end
-end
-
-local function ZigZagDecode(z : number) : number
-    if z % 2 == 0 then
-        return z // 2
-    else
-        return -((z + 1) // 2)
-    end
-end
-
-local function ReadAnyNumberFast(Source, CursorPosition, Count)
-    local Result = table.create(Count)
-    local Out = 1
-
-    while Out <= Count do
-        local Mask = BufferReadU32(Source, CursorPosition)
-        CursorPosition += 4
-
-        for Index = 0, 15 do
-            if Out > Count then break end
-            local Shift = Index * 2
-            local Tag = bit32.band(bit32.rshift(Mask, Shift), 3)
-
-            if Tag == 0 then
-                local v = BufferReadU8(Source, CursorPosition); CursorPosition += 1
-                Result[Out] = ZigZagDecode(v)
-            elseif Tag == 1 then
-                local v = BufferReadU16(Source, CursorPosition); CursorPosition += 2
-                Result[Out] = ZigZagDecode(v)
-            elseif Tag == 2 then
-                local v = BufferReadU32(Source, CursorPosition); CursorPosition += 4
-                Result[Out] = ZigZagDecode(v)
-            else
-                Result[Out] = BufferReadF64(Source, CursorPosition); CursorPosition += 8
-            end
-
-            Out += 1
-        end
-    end
-
-    return Result, CursorPosition
 end
 
 local DataTypes = {}
@@ -827,7 +777,7 @@ DataTypes.DateTime = {
 	Write = function(TargetBuffer, CursorPosition, Value : DateTime)
 		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 8)
 		local High, Low = DecomposeInt64(Value.UnixTimestampMillis)
-		BufferWriteU32(TargetBuffer, CursorPosition, High)ZigZagEncode
+		BufferWriteU32(TargetBuffer, CursorPosition, High)
 		BufferWriteU32(TargetBuffer, CursorPosition + 4, Low)
 		return TargetBuffer, CursorPosition + 8
 	end,
@@ -860,235 +810,93 @@ DataTypes.Buffer = {
 } :: TypeSerializer<buffer>
 
 DataTypes.Any = {
-	IsDynamic = true,
-	ContainsInstances = true,
-
+	IsDynamic = true, ContainsInstances = true,
 	GetByteSize = function(Value : any) : number
-		local Type = typeof(Value)
-
-		if Type == "number" then
-			return 1 + 8
-		elseif Type == "boolean" then
-			return 1 + 1
-		elseif Type == "string" then
-			return 1 + 4 + #Value
-		elseif Type == "Instance" then
-			return 1 + 3
-		elseif Type == "Vector3" then
-			return 1 + 12
-		elseif Type == "Vector2" then
-			return 1 + 8
-		elseif Type == "CFrame" then
-			return 1 + 24
-		elseif Type == "Color3" then
-			return 1 + 3
-		elseif Type == "UDim2" then
-			return 1 + 16
-		elseif Type == "DateTime" then
-			return 1 + 8
-		elseif Type == "buffer" then
-			return 1 + 4 + BufferLen(Value)
-		elseif Type == "EnumItem" then
-			return 1 + 7 + #tostring(Value.EnumType)
-		end
-
-		return 1
+		local T = typeof(Value)
+		if T == "number" then return 9
+		elseif T == "string" then return 5 + #Value
+		elseif T == "boolean" then return 2
+		elseif T == "Instance" then return 3
+		elseif T == "EnumItem" then return 7 + #(tostring(Value.EnumType))
+		elseif T == "Vector3" then return 13
+		elseif T == "Vector2" then return 9
+		elseif T == "CFrame" then return 25
+		elseif T == "Color3" then return 4
+		elseif T == "UDim2" then return 17
+		elseif T == "DateTime" then return 9
+		elseif T == "buffer" then return 5 + BufferLen(Value)
+		else return 1 end
 	end,
-
-	Write = function(
-		TargetBuffer : buffer,
-		CursorPosition : number,
-		Value : any,
-		InstanceAccumulator : { Instance },
-		InstanceLookUp : { [Instance] : number }
-	)
+	Write = function(TargetBuffer, CursorPosition, Value, InstanceAccumulator, InstanceLookup)
+		local T = typeof(Value)
 		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 1)
 
-		if Value == nil then
-			BufferWriteU8(TargetBuffer, CursorPosition, 0)
-			return TargetBuffer, CursorPosition + 1
-		end
-
-		local Type = typeof(Value)
-
-		if Type == "number" then
-			BufferWriteU8(TargetBuffer, CursorPosition, 1)
-			TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition + 1, 8)
-			BufferWriteF64(TargetBuffer, CursorPosition + 1, Value)
-			return TargetBuffer, CursorPosition + 9
-
-		elseif Type == "boolean" then
-			BufferWriteU8(TargetBuffer, CursorPosition, 2)
-			TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition + 1, 1)
-			BufferWriteU8(TargetBuffer, CursorPosition + 1, Value and 1 or 0)
-			return TargetBuffer, CursorPosition + 2
-
-		elseif Type == "string" then
-			BufferWriteU8(TargetBuffer, CursorPosition, 3)
-			return DataTypes.String.Write(
-				TargetBuffer,
-				CursorPosition + 1,
-				Value,
-				InstanceAccumulator,
-				InstanceLookUp
-			)
-
-		elseif Type == "Instance" then
-			BufferWriteU8(TargetBuffer, CursorPosition, 4)
-			return DataTypes.Instance.Write(
-				TargetBuffer,
-				CursorPosition + 1,
-				Value,
-				InstanceAccumulator,
-				InstanceLookUp
-			)
-
-		elseif Type == "Vector3" then
-			BufferWriteU8(TargetBuffer, CursorPosition, 5)
-			return DataTypes.Vector3.Write(TargetBuffer, CursorPosition + 1, Value, InstanceAccumulator, InstanceLookUp)
-
-		elseif Type == "Vector2" then
+		if Value == nil then BufferWriteU8(TargetBuffer, CursorPosition, 0) return TargetBuffer, CursorPosition + 1
+		elseif T == "boolean" then BufferWriteU8(TargetBuffer, CursorPosition, 1) return DataTypes.Boolean.Write(TargetBuffer, CursorPosition + 1, Value :: boolean, InstanceAccumulator, InstanceLookup)
+		elseif T == "number" then BufferWriteU8(TargetBuffer, CursorPosition, 2) return DataTypes.Float64.Write(TargetBuffer, CursorPosition + 1, Value :: number, InstanceAccumulator, InstanceLookup)
+		elseif T == "string" then BufferWriteU8(TargetBuffer, CursorPosition, 3) return DataTypes.String.Write(TargetBuffer, CursorPosition + 1, Value :: string, InstanceAccumulator, InstanceLookup)
+		elseif T == "Instance" then BufferWriteU8(TargetBuffer, CursorPosition, 4) return DataTypes.Instance.Write(TargetBuffer, CursorPosition + 1, Value :: Instance, InstanceAccumulator, InstanceLookup)
+		elseif T == "Vector3" then BufferWriteU8(TargetBuffer, CursorPosition, 5) return DataTypes.Vector3.Write(TargetBuffer, CursorPosition + 1, Value :: Vector3, InstanceAccumulator, InstanceLookup)
+		elseif T == "EnumItem" then
 			BufferWriteU8(TargetBuffer, CursorPosition, 6)
-			return DataTypes.Vector2.Write(TargetBuffer, CursorPosition + 1, Value, InstanceAccumulator, InstanceLookUp)
-
-		elseif Type == "CFrame" then
-			BufferWriteU8(TargetBuffer, CursorPosition, 7)
-			return DataTypes.CFrame.Write(TargetBuffer, CursorPosition + 1, Value, InstanceAccumulator, InstanceLookUp)
-
-		elseif Type == "Color3" then
-			BufferWriteU8(TargetBuffer, CursorPosition, 8)
-			return DataTypes.Color3.Write(TargetBuffer, CursorPosition + 1, Value, InstanceAccumulator, InstanceLookUp)
-
-		elseif Type == "UDim2" then
-			BufferWriteU8(TargetBuffer, CursorPosition, 9)
-			return DataTypes.UDim2.Write(TargetBuffer, CursorPosition + 1, Value, InstanceAccumulator, InstanceLookUp)
-
-		elseif Type == "DateTime" then
-			BufferWriteU8(TargetBuffer, CursorPosition, 10)
-			return DataTypes.DateTime.Write(TargetBuffer, CursorPosition + 1, Value, InstanceAccumulator, InstanceLookUp)
-
-		elseif Type == "buffer" then
-			BufferWriteU8(TargetBuffer, CursorPosition, 11)
-			return DataTypes.Buffer.Write(TargetBuffer, CursorPosition + 1, Value, InstanceAccumulator, InstanceLookUp)
-
-		elseif Type == "EnumItem" then
-			BufferWriteU8(TargetBuffer, CursorPosition, 12)
-			return DataTypes.EnumItem.Write(TargetBuffer, CursorPosition + 1, Value, InstanceAccumulator, InstanceLookUp)
-		end
-
-		BufferWriteU8(TargetBuffer, CursorPosition, 255)
-		return TargetBuffer, CursorPosition + 1
+			TargetBuffer, CursorPosition = DataTypes.String.Write(TargetBuffer, CursorPosition + 1, tostring((Value :: EnumItem).EnumType), InstanceAccumulator, InstanceLookup)
+			TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 2)
+			BufferWriteU16(TargetBuffer, CursorPosition, (Value :: EnumItem).Value)
+			return TargetBuffer, CursorPosition + 2
+		elseif T == "CFrame" then BufferWriteU8(TargetBuffer, CursorPosition, 7) return DataTypes.CFrame.Write(TargetBuffer, CursorPosition + 1, Value :: CFrame, InstanceAccumulator, InstanceLookup)
+		elseif T == "Vector2" then BufferWriteU8(TargetBuffer, CursorPosition, 8) return DataTypes.Vector2.Write(TargetBuffer, CursorPosition + 1, Value :: Vector2, InstanceAccumulator, InstanceLookup)
+		elseif T == "Color3" then BufferWriteU8(TargetBuffer, CursorPosition, 9) return DataTypes.Color3.Write(TargetBuffer, CursorPosition + 1, Value :: Color3, InstanceAccumulator, InstanceLookup)
+		elseif T == "UDim2" then BufferWriteU8(TargetBuffer, CursorPosition, 10) return DataTypes.UDim2.Write(TargetBuffer, CursorPosition + 1, Value :: UDim2, InstanceAccumulator, InstanceLookup)
+		elseif T == "DateTime" then BufferWriteU8(TargetBuffer, CursorPosition, 11) return DataTypes.DateTime.Write(TargetBuffer, CursorPosition + 1, Value :: DateTime, InstanceAccumulator, InstanceLookup)
+		elseif T == "buffer" then BufferWriteU8(TargetBuffer, CursorPosition, 12) return DataTypes.Buffer.Write(TargetBuffer, CursorPosition + 1, Value :: buffer, InstanceAccumulator, InstanceLookup)
+		else error(string.format("[%s] Unsupported Any type: %s", IonErrorCodes.NOT_SUPPORTED, T)) end
 	end,
-} :: TypeSerializer<any>
-
-DataTypes.AnyNumberFast = {
-	IsDynamic = true,
-	ContainsInstances = false,
-
-	GetByteSize = function()
-		return nil
-	end,
-
-	Write = function(
-		TargetBuffer : buffer,
-		CursorPosition : number,
-		Value : any,
-		InstanceAccumulator,
-		InstanceLookUp
-	)
-		if typeof(Value) ~= "table" then
-			return DataTypes.Any.Write(
-				TargetBuffer,
-				CursorPosition,
-				Value,
-				InstanceAccumulator,
-				InstanceLookUp
-			)
-		end
-
-		local Count = #Value
-
-		for Index = 1, Count do
-			if type(Value[Index]) ~= "number" then
-				return DataTypes.Any.Write(
-					TargetBuffer,
-					CursorPosition,
-					Value,
-					InstanceAccumulator,
-					InstanceLookUp
-				)
-			end
-		end
-
-		TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 2)
-		BufferWriteU16(TargetBuffer, CursorPosition, Count)
-		CursorPosition += 2
-
-		local Index = 1
-
-		while Index <= Count do
-			TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 4)
-			local MaskPos = CursorPosition
-			CursorPosition += 4
-
-			local Mask = 0
-			local Shift = 0
-
-			for _ = 1, 16 do
-				if Index > Count then break end
-
-				local V = Value[Index]
-				Index += 1
-
-				if V % 1 == 0 then
-					local ZZ = ZigZagEncode(V)
-
-					if ZZ <= 0xFF then
-						TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 1)
-						BufferWriteU8(TargetBuffer, CursorPosition, ZZ)
-						CursorPosition += 1
-
-					elseif ZZ <= 0xFFFF then
-						Mask = bit32.bor(Mask, bit32.lshift(1, Shift))
-						TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 2)
-						BufferWriteU16(TargetBuffer, CursorPosition, ZZ)
-						CursorPosition += 2
-
-					elseif ZZ <= 0xFFFFFFFF then
-						Mask = bit32.bor(Mask, bit32.lshift(2, Shift))
-						TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 4)
-						BufferWriteU32(TargetBuffer, CursorPosition, ZZ)
-						CursorPosition += 4
-
-					else
-						Mask = bit32.bor(Mask, bit32.lshift(3, Shift))
-						TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 8)
-						BufferWriteF64(TargetBuffer, CursorPosition, V)
-						CursorPosition += 8
+	Read = function(TargetBuffer, CursorPosition, InstanceSource) : (any, number)
+		CheckBounds(TargetBuffer, CursorPosition, 1)
+		local Id = BufferReadU8(TargetBuffer, CursorPosition)
+		CursorPosition += 1
+		if Id == 0 then return nil, CursorPosition
+		elseif Id == 1 then return DataTypes.Boolean.Read(TargetBuffer, CursorPosition, InstanceSource)
+		elseif Id == 2 then return DataTypes.Float64.Read(TargetBuffer, CursorPosition, InstanceSource)
+		elseif Id == 3 then return DataTypes.String.Read(TargetBuffer, CursorPosition, InstanceSource)
+		elseif Id == 4 then return DataTypes.Instance.Read(TargetBuffer, CursorPosition, InstanceSource)
+		elseif Id == 5 then return DataTypes.Vector3.Read(TargetBuffer, CursorPosition, InstanceSource)
+		elseif Id == 6 then
+			local EnumName, NextPos = DataTypes.String.Read(TargetBuffer, CursorPosition, InstanceSource)
+			CheckBounds(TargetBuffer, NextPos, 2)
+			local Val = BufferReadU16(TargetBuffer, NextPos)
+			local EnumType = (Enum :: any)[EnumName]
+			if EnumType then
+				local Cache = AnyEnumCache[EnumType]
+				if not Cache then
+					if #AnyEnumCacheOrder >= MaxEnumCacheSize then
+						local Oldest = table.remove(AnyEnumCacheOrder, 1)
+						AnyEnumCache[Oldest] = nil
 					end
-				else
-					Mask = bit32.bor(Mask, bit32.lshift(3, Shift))
-					TargetBuffer = EnsureCapacity(TargetBuffer, CursorPosition, 8)
-					BufferWriteF64(TargetBuffer, CursorPosition, V)
-					CursorPosition += 8
+					Cache = {}
+					for _, Item in ipairs(EnumType:GetEnumItems()) do Cache[Item.Value] = Item end
+					AnyEnumCache[EnumType] = Cache
+					table.insert(AnyEnumCacheOrder, EnumType)
 				end
-
-				Shift += 2
+				local Item = Cache[Val]
+				if not Item then
+					warn(string.format("Ion: Invalid Enum value %d for %s", Val, EnumName))
+					local Items = EnumType:GetEnumItems()
+					if #Items == 0 then return nil, NextPos + 2 end
+					return Items[1], NextPos + 2
+				end
+				return Item, NextPos + 2
 			end
-
-			BufferWriteU32(TargetBuffer, MaskPos, Mask)
-		end
-
-		return TargetBuffer, CursorPosition
-	end,
-
-	Read = function(Source, CursorPosition)
-		local Count = BufferReadU16(Source, CursorPosition)
-		CursorPosition += 2
-		return ReadAnyNumberFast(Source, CursorPosition, Count)
-	end,
+			return nil, NextPos + 2
+		elseif Id == 7 then return DataTypes.CFrame.Read(TargetBuffer, CursorPosition, InstanceSource)
+		elseif Id == 8 then return DataTypes.Vector2.Read(TargetBuffer, CursorPosition, InstanceSource)
+		elseif Id == 9 then return DataTypes.Color3.Read(TargetBuffer, CursorPosition, InstanceSource)
+		elseif Id == 10 then return DataTypes.UDim2.Read(TargetBuffer, CursorPosition, InstanceSource)
+		elseif Id == 11 then return DataTypes.DateTime.Read(TargetBuffer, CursorPosition, InstanceSource)
+		elseif Id == 12 then return DataTypes.Buffer.Read(TargetBuffer, CursorPosition, InstanceSource)
+		else error(string.format("[%s] Unknown Any Type ID: %d", IonErrorCodes.SERIALIZATION_FAILED, Id)) end
+	end
 } :: TypeSerializer<any>
-
 
 function DataTypes.Array<T>(Inner : TypeSerializer<T>) : TypeSerializer<{ T }>
 	if Inner.IsUnbounded then error("Ion: RestOfString cannot be used inside Array") end
@@ -1231,124 +1039,48 @@ end
 local Ion = {}
 Ion.Types = DataTypes
 
-local function PreparePacket(
-	Schema : { TypeSerializer<any> },
-	Args : { any },
-	Hash : number,
-	SchemaVersion : number,
-	UseCompression : boolean,
-	CompressThreshold : number
-): (buffer?, { Instance }?, string?)
+local function PreparePacket(Schema: { TypeSerializer<any> }, Args: { any }, Hash: number, SchemaVersion: number, UseCompression: boolean, CompressThreshold: number): (buffer?, { Instance }?, string?)
+	local PayloadBuf = AcquireBuffer(1024)
 
-	local SchemaLenght = #Schema
-	local StaticPossible = true
-	local EstimatedSize = 0
-
-	for Index = 1, SchemaLenght do
-		local Serializer = Schema[Index]
-
-		if Serializer.IsDynamic then
-			StaticPossible = false
-			break
+	local Success, Result = pcall(function()
+		local Cursor, Acc, Look = 0, {}, {}
+		for Index, Serializer in ipairs(Schema) do 
+			PayloadBuf, Cursor = Serializer.Write(PayloadBuf, Cursor, Args[Index], Acc, Look) 
 		end
 
-		local Passed, Size = pcall(Serializer.GetByteSize, Serializer, Args[Index])
-		if not Passed then
-			StaticPossible = false
-			break
-		end
-
-		EstimatedSize += Size
-	end
-
-	if StaticPossible then
-		local FinalPayload = BufferCreate(EstimatedSize)
-		local CursorPosition = 0
-
-		local InstanceAccumulator = table.create(4)
-		local InstanceLookUp = {}
-
-		for Index = 1, SchemaLenght do
-			local Serializer = Schema[Index]
-			FinalPayload, CursorPosition =
-				Serializer.Write(FinalPayload, CursorPosition, Args[Index], InstanceAccumulator, InstanceLookUp)
-		end
+		local FinalSize = Cursor
+		local FinalPayload = BufferCreate(FinalSize)
+		BufferCopy(FinalPayload, 0, PayloadBuf, 0, FinalSize)
 
 		local IsCompressed = false
-
-		if UseCompression and CursorPosition > CompressThreshold then
-			local Passed, Compressed = pcall(function()
-				return EncodingService:CompressBuffer(FinalPayload, Enum.CompressionAlgorithm.Zstd)
-			end)
-
-			if Passed and BufferLen(Compressed) < CursorPosition then
-				local UncompressedSize = BufferLen(FinalPayload)
-				FinalPayload = Compressed
+		if UseCompression and FinalSize > CompressThreshold then
+			local CompData = EncodingService:CompressBuffer(FinalPayload, Enum.CompressionAlgorithm.Zstd)
+			if BufferLen(CompData) < FinalSize then
+				FinalPayload = CompData
 				IsCompressed = true
-				PerformanceStats.CompressionSavings += (UncompressedSize - BufferLen(Compressed))
+				PerformanceStats.CompressionSavings += (FinalSize - BufferLen(CompData))
 			end
 		end
 
-		local PayloadLength = BufferLen(FinalPayload)
-		local Header = BufferCreate(7 + PayloadLength)
-		BufferWriteU8(Header, 0, IonVersion)
-		BufferWriteU32(Header, 1, Hash)
-		BufferWriteU8(Header, 5, IsCompressed and 1 or 0)
-		BufferWriteU8(Header, 6, SchemaVersion)
-		BufferCopy(Header, 7, FinalPayload, 0, PayloadLength)
-
-		return Header, InstanceAccumulator, nil
-	end
-
-	local PayloadBuffer = AcquireBuffer(1024)
-	local CursorPosition = 0
-
-	local InstanceAccumulator = table.create(4)
-	local InstanceLookUp = {}
-
-	local Passed, ErrorMessage = pcall(function()
-		for Index = 1, SchemaLenght do
-			local Serializer = Schema[Index]
-			PayloadBuffer, CursorPosition =
-				Serializer.Write(PayloadBuffer, CursorPosition, Args[Index], InstanceAccumulator, InstanceLookUp)
-		end
+		return { Payload = FinalPayload, Compressed = IsCompressed, Inst = Acc }
 	end)
 
-	if not Passed then
-		ReleaseBuffer(PayloadBuffer)
-		return nil, nil, tostring(ErrorMessage)
+	ReleaseBuffer(PayloadBuf)
+
+	if not Success then 
+		return nil, nil, "Serialization Failed: " .. tostring(Result)
 	end
 
-	local FinalPayload = BufferCreate(CursorPosition)
-	BufferCopy(FinalPayload, 0, PayloadBuffer, 0, CursorPosition)
-	ReleaseBuffer(PayloadBuffer)
-
-	local IsCompressed = false
-
-	if UseCompression and CursorPosition > CompressThreshold then
-		local Passed, Compressed = pcall(function()
-			return EncodingService:CompressBuffer(FinalPayload, Enum.CompressionAlgorithm.Zstd)
-		end)
-
-		if Passed and BufferLen(Compressed) < CursorPosition then
-			local UncompressedSize = BufferLen(FinalPayload)
-			FinalPayload = Compressed
-			IsCompressed = true
-			PerformanceStats.CompressionSavings += (UncompressedSize - BufferLen(Compressed))
-		end
-	end
-
-	local PayloadLength = BufferLen(FinalPayload)
-	local Header = BufferCreate(7 + PayloadLength)
+	local PacketData = Result
+	local Header = BufferCreate(7 + BufferLen(PacketData.Payload))
 	BufferWriteU8(Header, 0, IonVersion)
 	BufferWriteU32(Header, 1, Hash)
-	BufferWriteU8(Header, 5, IsCompressed and 1 or 0)
+	BufferWriteU8(Header, 5, PacketData.Compressed and 1 or 0)
 	BufferWriteU8(Header, 6, SchemaVersion)
-	BufferCopy(Header, 7, FinalPayload, 0, PayloadLength)
+	BufferCopy(Header, 7, PacketData.Payload, 0, BufferLen(PacketData.Payload))
 
-	return Header, InstanceAccumulator, nil
+	return Header, PacketData.Inst, nil
 end
-
 
 local function GetStubPacket()
 	return {
