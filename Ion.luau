@@ -123,6 +123,12 @@ export type IonDefinitionOptions = {
 	}?
 }
 
+export type ClientConfig = {
+	WaitForCharacter: boolean?,
+	WaitForTimeout: number?,
+	CustomReadyCheck: (() -> boolean)?
+}
+
 local BufferPool : { buffer } = {}
 local BufferPoolInitialized : boolean = false
 
@@ -145,11 +151,23 @@ type PacketMetadata = {
 	ServerRateLimitState : { [number] : RateLimitState }?
 }
 
+type QueuedPacket = {
+	Hash: number,
+	Buffer: buffer,
+	Instances: { Instance }?
+}
+
 local Definitions : { [number] : any } = {}
 local Listeners : { [number] : (...any) -> () } = {}
 local RemoteCache : { [number] : RemoteEvent | UnreliableRemoteEvent } = {}
 local RemoteConnections : { [number] : RBXScriptConnection } = {}
 local ActivePackets : { [number] : PacketMetadata } = {}
+
+-- Client Initialization State
+local PlayerReadyState : { [Player] : boolean } = {}
+local PacketQueue : { [Player] : { QueuedPacket } } = {}
+local HandshakeRemote : RemoteEvent? = nil
+local HandshakeName = "Ion_Internal_Handshake"
 
 local DebugMode = false
 local DebugLogger : ((message: string, level: string) -> ())? = nil
@@ -163,7 +181,8 @@ local PerformanceStats = {
 	AverageDeserializationTime = 0,
 	BufferPoolHits = 0,
 	BufferPoolMisses = 0,
-	CompressionSavings = 0
+	CompressionSavings = 0,
+	PacketsQueued = 0
 }
 
 local function DebugLog(Message : string, Level : string?)
@@ -1039,6 +1058,49 @@ end
 local Ion = {}
 Ion.Types = DataTypes
 
+-- Initialize Handshake Remote on Server
+if RunService:IsServer() then
+	local Remote = Instance.new("RemoteEvent")
+	Remote.Name = HandshakeName
+	Remote.Parent = ReplicatedStorage
+	HandshakeRemote = Remote
+	
+	local function FlushQueue(Player: Player)
+		local Queue = PacketQueue[Player]
+		if not Queue then return end
+		
+		for _, Item in ipairs(Queue) do
+			local PacketDef = ActivePackets[Item.Hash]
+			if PacketDef and not PacketDef.IsDestroyed then
+				local RemoteObj = RemoteCache[Item.Hash]
+				if RemoteObj and RemoteObj:IsA("RemoteEvent") then -- Unreliable are skipped if queued? No, we send all.
+					-- Note: Unreliable packets in queue are sent as reliable (RemoteEvent) to ensure order? 
+					-- Actually, we must use the original remote.
+					if RemoteObj:IsA("UnreliableRemoteEvent") then
+						RemoteObj:FireClient(Player, Item.Buffer, Item.Instances)
+					else
+						(RemoteObj :: RemoteEvent):FireClient(Player, Item.Buffer, Item.Instances)
+					end
+				end
+			end
+		end
+		
+		PacketQueue[Player] = nil
+	end
+
+	Remote.OnServerEvent:Connect(function(Player)
+		if PlayerReadyState[Player] then return end
+		DebugLog("Player Ready: " .. Player.Name, "INFO")
+		PlayerReadyState[Player] = true
+		FlushQueue(Player)
+	end)
+
+	Players.PlayerRemoving:Connect(function(Player)
+		PlayerReadyState[Player] = nil
+		PacketQueue[Player] = nil
+	end)
+end
+
 local function PreparePacket(Schema: { TypeSerializer<any> }, Args: { any }, Hash: number, SchemaVersion: number, UseCompression: boolean, CompressThreshold: number): (buffer?, { Instance }?, string?)
 	local PayloadBuf = AcquireBuffer(1024)
 
@@ -1097,6 +1159,44 @@ local function GetStubPacket()
 		},
 		Destroy = function() end
 	}
+end
+
+function Ion.ConfigureClient(Config: ClientConfig)
+	if RunService:IsServer() then
+		warn("Ion: ConfigureClient should only be called on the Client")
+		return
+	end
+
+	local Player = Players.LocalPlayer
+	local Handshake = ReplicatedStorage:WaitForChild(HandshakeName, 10)
+	if not Handshake then
+		warn("Ion: Handshake remote missing. Client ready state will not be sent.")
+		return
+	end
+
+	task.spawn(function()
+		local Timeout = Config.WaitForTimeout or 30
+		local StartTime = os.clock()
+
+		if Config.WaitForCharacter ~= false then -- Default true
+			if not Player.Character then
+				Player.CharacterAdded:Wait()
+			end
+		end
+
+		if Config.CustomReadyCheck then
+			while not Config.CustomReadyCheck() do
+				if (os.clock() - StartTime) > Timeout then
+					warn("Ion: Client ready check timed out")
+					break
+				end
+				task.wait(0.1)
+			end
+		end
+
+		(Handshake :: RemoteEvent):FireServer()
+		DebugLog("Client marked as Ready", "INFO")
+	end)
 end
 
 function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Options : IonDefinitionOptions?): IonPacket<...any>
@@ -1340,7 +1440,14 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 
 			for _, Player in (Players:GetPlayers()) do
 				if not ExcludedMap[Player] then
-					Remote:FireClient(Player, PacketBuffer, PacketInsts)
+					if PlayerReadyState[Player] then
+						Remote:FireClient(Player, PacketBuffer, PacketInsts)
+					else
+						-- Queue packet
+						if not PacketQueue[Player] then PacketQueue[Player] = {} end
+						table.insert(PacketQueue[Player], { Hash = Hash, Buffer = PacketBuffer, Instances = PacketInsts })
+						PerformanceStats.PacketsQueued += 1
+					end
 				end
 			end
 
@@ -1438,7 +1545,27 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 			DebugLog("Sent Packet "..Namespace, "DEBUG")
 
 			if RunService:IsServer() then
-				if Target then Remote:FireClient(Target, PacketBuffer, PacketInsts) else Remote:FireAllClients(PacketBuffer, PacketInsts) end
+				if Target then
+					if PlayerReadyState[Target] then
+						Remote:FireClient(Target, PacketBuffer, PacketInsts)
+					else
+						if not PacketQueue[Target] then PacketQueue[Target] = {} end
+						table.insert(PacketQueue[Target], { Hash = Hash, Buffer = PacketBuffer, Instances = PacketInsts })
+						PerformanceStats.PacketsQueued += 1
+					end
+				else
+					-- SendToAll (Target is nil)
+					-- Optimize by sending to all ready players, queueing for others
+					for _, Player in ipairs(Players:GetPlayers()) do
+						if PlayerReadyState[Player] then
+							Remote:FireClient(Player, PacketBuffer, PacketInsts)
+						else
+							if not PacketQueue[Player] then PacketQueue[Player] = {} end
+							table.insert(PacketQueue[Player], { Hash = Hash, Buffer = PacketBuffer, Instances = PacketInsts })
+							PerformanceStats.PacketsQueued += 1
+						end
+					end
+				end
 			else
 				Remote:FireServer(PacketBuffer, PacketInsts)
 			end
@@ -1476,12 +1603,19 @@ function Ion.Define(Namespace : string, Schema : { TypeSerializer<any> }, Option
 			local Remote : any = RemoteCache[Hash]
 			for _, Player in ipairs(Recipients) do
 				if Player and Player.Parent then 
-					local SendSuccess = pcall(function()
-						Remote:FireClient(Player, PacketBuffer, PacketInsts) 
-					end)
-					if not SendSuccess then
-						DebugLog("SendToList failed for player: " .. tostring(Player), "WARN")
-						table.insert(Failed, Player)
+					if PlayerReadyState[Player] then
+						local SendSuccess = pcall(function()
+							Remote:FireClient(Player, PacketBuffer, PacketInsts) 
+						end)
+						if not SendSuccess then
+							DebugLog("SendToList failed for player: " .. tostring(Player), "WARN")
+							table.insert(Failed, Player)
+						end
+					else
+						-- Queue
+						if not PacketQueue[Player] then PacketQueue[Player] = {} end
+						table.insert(PacketQueue[Player], { Hash = Hash, Buffer = PacketBuffer, Instances = PacketInsts })
+						PerformanceStats.PacketsQueued += 1
 					end
 				else 
 					table.insert(Failed, Player :: Player) 
